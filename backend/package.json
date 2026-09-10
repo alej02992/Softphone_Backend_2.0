@@ -1,0 +1,19 @@
+{
+  "name": "bpm-backend",
+  "version": "1.0.0",
+  "description": "Backend de la plataforma de Contact Center de BPM Consulting",
+  "main": "src/servidor.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/servidor.js",
+    "dev": "node --watch src/servidor.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "mysql2": "^3.11.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7"
+  }
+}
