@@ -30,6 +30,7 @@ router.post('/', async (req, res, next) => {
 
     const u = await bd.una(
       `SELECT u.id, u.usuario, u.nombre, u.clave_hash, u.extension, u.activo,
+              u.debe_cambiar_clave,
               r.nombre AS rol, u.campana_id, c.nombre AS campana
        FROM usuario u
        JOIN rol r ON r.id = u.rol_id
@@ -56,16 +57,43 @@ router.post('/', async (req, res, next) => {
       [u.id]
     );
 
-    /* Se crea la sesión con su credencial SIP temporal */
+    /* ── Credencial SIP de la sesión ──────────────────────────────
+       Con Realtime, cada inicio de sesión genera una contraseña nueva
+       y la escribe en la extensión de Asterisk. Así, si alguien copia
+       la clave que ve el navegador, deja de servir en cuanto el agente
+       cierra sesión o vuelve a entrar.
+
+       Sin Realtime, Asterisk lee su configuración de archivos y la
+       contraseña no se puede rotar: se usa la fija del entorno.      */
     const sesionId = crypto.randomUUID();
-    const claveSip = CONFIG.pbx.claveFija || generarClaveSip();
+    const claveSip = (CONFIG.realtime && u.extension)
+      ? generarClaveSip()
+      : (CONFIG.pbx.claveFija || generarClaveSip());
     const vence = new Date(Date.now() + 8 * 60 * 60 * 1000);   // 8 horas
 
-    await bd.consultar(
-      `INSERT INTO sesion (id, usuario_id, clave_sip, vence, ip)
-       VALUES (?, ?, ?, ?, ?)`,
-      [sesionId, u.id, claveSip, vence, req.ip]
-    );
+    await bd.transaccion(async (cx) => {
+      await cx.execute(
+        `INSERT INTO sesion (id, usuario_id, clave_sip, vence, ip)
+         VALUES (?, ?, ?, ?, ?)`,
+        [sesionId, u.id, claveSip, vence, req.ip]
+      );
+
+      /* Se rota la contraseña en la extensión. Si esto falla, tampoco
+         se crea la sesión: el agente no recibiría una credencial que
+         la central no reconoce. */
+      if (CONFIG.realtime && u.extension) {
+        await cx.execute('UPDATE ps_auths SET password = ? WHERE id = ?',
+          [claveSip, u.extension]);
+      }
+
+      /* Sesiones anteriores del mismo usuario quedan cerradas: una
+         persona, una sesión. */
+      await cx.execute(
+        `UPDATE sesion SET cerrada = NOW()
+          WHERE usuario_id = ? AND cerrada IS NULL AND id <> ?`,
+        [u.id, sesionId]
+      );
+    });
 
     await bd.consultar('UPDATE usuario SET ultimo_acceso = NOW() WHERE id = ?', [u.id]);
 
@@ -80,6 +108,11 @@ router.post('/', async (req, res, next) => {
         campana: u.campana,
         campana_id: u.campana_id,
         permisos: permisos.map((p) => p.clave),
+
+        /* Si es TRUE, la plataforma muestra la pantalla de cambio de
+           contraseña y no deja entrar al escritorio hasta que la
+           cambie. Es el primer acceso, o un restablecimiento. */
+        debeCambiarClave: !!u.debe_cambiar_clave,
       },
     });
   } catch (e) { next(e); }
@@ -117,6 +150,43 @@ router.post('/sip', auth.exigirSesion, auth.exigir('softphone'), async (req, res
   } catch (e) { next(e); }
 });
 
+
+/* ── Cambiar la propia contraseña ────────────────────────────────
+   La usa el agente en su primer acceso. No requiere permiso de
+   administración: cualquiera puede cambiar la suya.                */
+router.put('/clave', auth.exigirSesion, async (req, res, next) => {
+  try {
+    const { claveActual, claveNueva } = req.body;
+
+    if (!claveActual || !claveNueva) {
+      return res.status(400).json({ error: 'Faltan la contraseña actual y la nueva' });
+    }
+    if (String(claveNueva).length < 8) {
+      return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 8 caracteres' });
+    }
+    if (claveActual === claveNueva) {
+      return res.status(400).json({ error: 'La nueva contraseña debe ser distinta de la actual' });
+    }
+
+    const u = await bd.una('SELECT clave_hash FROM usuario WHERE id = ?', [req.usuario.id]);
+    if (!u) return res.status(404).json({ error: 'El usuario no existe' });
+
+    if (!(await auth.verificarClave(claveActual, u.clave_hash))) {
+      return res.status(401).json({ error: 'La contraseña actual no es correcta' });
+    }
+
+    /* Se guarda la nueva y se baja la bandera de cambio obligatorio. */
+    await bd.consultar(
+      'UPDATE usuario SET clave_hash = ?, debe_cambiar_clave = FALSE WHERE id = ?',
+      [await auth.cifrarClave(claveNueva), req.usuario.id]
+    );
+
+    await auth.auditar(req.usuario.id, 'modificar', 'usuario', req.usuario.id,
+      'Cambió su propia contraseña', req.ip);
+
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
 
 /* ── Cerrar sesión ───────────────────────────────────────────────────
    Marca la sesión como cerrada. A partir de ese momento el token deja

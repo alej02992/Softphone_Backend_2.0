@@ -23,6 +23,12 @@ const CONFIG = {
     base: process.env.BD_BASE || 'bpm_contact',
   },
 
+  /* ── Contraseña temporal ──
+     La que se asigna al crear un usuario y al restablecer. La persona
+     la cambia obligatoriamente en su primer acceso, así que no hace
+     falta que sea secreta, pero sí que no sea adivinable.           */
+  claveTemporal: process.env.CLAVE_TEMPORAL || 'BpmTemp2026#',
+
   /* ── Sesiones ──
      La clave firma los tokens. Si alguien la conoce puede fabricar
      sesiones falsas, así que en el servidor debe ser larga y aleatoria:

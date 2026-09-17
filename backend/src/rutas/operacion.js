@@ -19,27 +19,115 @@ router.use(auth.exigirSesion);
 router.get('/campanas', async (req, res, next) => {
   try {
     res.json(await bd.consultar(
-      `SELECT id, nombre, tipo, cola_asterisk, hora_apertura, hora_cierre,
-              abierta, acw_segundos, activa
+      `SELECT id, nombre, tipo, cola_asterisk, did, formulario_id,
+              hora_apertura, hora_cierre, abierta, acw_segundos, activa
        FROM campana WHERE activa = TRUE ORDER BY nombre`));
   } catch (e) { next(e); }
 });
 
 router.post('/campanas', auth.exigir('campanas'), async (req, res, next) => {
   try {
-    const { nombre, tipo, cola_asterisk, hora_apertura, hora_cierre, acw_segundos } = req.body;
-    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    const { nombre, tipo, cola_asterisk, did, formulario_id,
+            hora_apertura, hora_cierre, acw_segundos } = req.body;
 
-    const [r] = await bd.pool.execute(
-      `INSERT INTO campana (nombre, tipo, cola_asterisk, hora_apertura, hora_cierre, acw_segundos)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [nombre, tipo || 'entrante', cola_asterisk || null,
-       hora_apertura || '08:00:00', hora_cierre || '18:00:00', acw_segundos || 60]
-    );
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre de la campaña' });
+    if (!cola_asterisk) return res.status(400).json({ error: 'Falta la cola de Asterisk' });
 
-    await auth.auditar(req.usuario.id, 'crear', 'campana', r.insertId,
-      `Creó la campaña ${nombre}`, req.ip);
-    res.status(201).json({ id: r.insertId });
+    /* Una campaña que recibe llamadas necesita un número por donde
+       entren. Sin él, no hay forma de enrutar hacia ella. */
+    if (tipo !== 'saliente' && !did) {
+      return res.status(400).json({ error: 'Una campaña de entrada necesita un DID' });
+    }
+
+    const repetida = await bd.una(
+      'SELECT id FROM campana WHERE nombre = ? OR cola_asterisk = ?',
+      [nombre, cola_asterisk]);
+    if (repetida) {
+      return res.status(409).json({ error: 'Ya existe una campaña con ese nombre o esa cola' });
+    }
+
+    const r = await bd.transaccion(async (cx) => {
+      const [ins] = await cx.execute(
+        `INSERT INTO campana (nombre, tipo, cola_asterisk, did, formulario_id,
+                              hora_apertura, hora_cierre, acw_segundos)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [nombre, tipo || 'entrante', cola_asterisk, did || null, formulario_id || null,
+         hora_apertura || '08:00:00', hora_cierre || '18:00:00', acw_segundos || 60]
+      );
+
+      /* La cola en Asterisk. El tiempo de cierre de la cola debe
+         coincidir con el de la plataforma, o el agente recibiría una
+         llamada nueva mientras aún está tipificando. */
+      const cola = await asterisk.crearCola(cx, {
+        nombre: cola_asterisk,
+        wrapuptime: acw_segundos || 60,
+      });
+
+      return { id: ins.insertId, colaCreada: cola.creada, motivo: cola.motivo };
+    });
+
+    await auth.auditar(req.usuario.id, 'crear', 'campana', r.id,
+      `Creó la campaña ${nombre} sobre la cola ${cola_asterisk}`, req.ip);
+    res.status(201).json(r);
+  } catch (e) { next(e); }
+});
+
+/* Modificar una campaña. */
+router.put('/campanas/:id', auth.exigir('campanas'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const c = await bd.una('SELECT nombre, cola_asterisk FROM campana WHERE id = ?', [id]);
+    if (!c) return res.status(404).json({ error: 'La campaña no existe' });
+
+    const campos = [];
+    const valores = [];
+    const permitidos = ['nombre', 'tipo', 'did', 'formulario_id',
+                        'hora_apertura', 'hora_cierre', 'acw_segundos'];
+
+    permitidos.forEach((k) => {
+      if (req.body[k] !== undefined) { campos.push(`${k} = ?`); valores.push(req.body[k] || null); }
+    });
+
+    if (!campos.length) return res.status(400).json({ error: 'No hay nada que cambiar' });
+
+    valores.push(id);
+    await bd.consultar(`UPDATE campana SET ${campos.join(', ')} WHERE id = ?`, valores);
+
+    /* Si cambió el tiempo de cierre, se ajusta también en la cola */
+    if (req.body.acw_segundos !== undefined && c.cola_asterisk) {
+      await bd.consultar('UPDATE queues SET wrapuptime = ? WHERE name = ?',
+        [req.body.acw_segundos, c.cola_asterisk]).catch(() => {});
+    }
+
+    await auth.auditar(req.usuario.id, 'modificar', 'campana', id,
+      `Modificó la campaña ${c.nombre}`, req.ip);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+/* Desactivar una campaña. No se borra: sus interacciones deben
+   conservarse para los reportes históricos. */
+router.delete('/campanas/:id', auth.exigir('campanas'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const c = await bd.una('SELECT nombre, cola_asterisk FROM campana WHERE id = ?', [id]);
+    if (!c) return res.status(404).json({ error: 'La campaña no existe' });
+
+    const enUso = await bd.una(
+      'SELECT COUNT(*) AS n FROM usuario WHERE campana_id = ? AND activo = TRUE', [id]);
+    if (enUso.n > 0) {
+      return res.status(409).json({
+        error: `Hay ${enUso.n} usuario(s) asignados a esta campaña. Reasígnalos primero.` });
+    }
+
+    await bd.transaccion(async (cx) => {
+      await cx.execute('UPDATE campana SET activa = FALSE, abierta = FALSE WHERE id = ?', [id]);
+      if (c.cola_asterisk) await asterisk.eliminarCola(cx, c.cola_asterisk);
+    });
+
+    await auth.auditar(req.usuario.id, 'eliminar', 'campana', id,
+      `Desactivó la campaña ${c.nombre}`, req.ip);
+    res.json({ ok: true });
   } catch (e) { next(e); }
 });
 

@@ -13,6 +13,7 @@ const express = require('express');
 const crypto = require('crypto');
 const bd = require('../bd');
 const auth = require('../auth');
+const CONFIG = require('../config');
 const asterisk = require('../asterisk');
 
 const router = express.Router();
@@ -40,15 +41,17 @@ router.get('/', async (req, res, next) => {
 /* ── Crear ───────────────────────────────────────────────────────── */
 router.post('/', async (req, res, next) => {
   try {
-    const { usuario, nombre, correo, clave, rol_id, campana_id, extension } = req.body;
+    const { usuario, nombre, correo, rol_id, campana_id, extension } = req.body;
 
     /* 1. Validar lo que llega. Nunca se confía en el navegador. */
-    if (!usuario || !nombre || !clave || !rol_id) {
+    if (!usuario || !nombre || !rol_id) {
       return res.status(400).json({ error: 'Faltan datos obligatorios' });
     }
-    if (String(clave).length < 8) {
-      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
-    }
+
+    /* La contraseña NO la elige quien crea el usuario. Se asigna la
+       temporal y la persona la cambia en su primer acceso. Así nadie
+       maneja contraseñas ajenas. */
+    const clave = CONFIG.claveTemporal;
     if (extension && !/^\d{3,6}$/.test(extension)) {
       return res.status(400).json({ error: 'La extensión debe tener entre 3 y 6 dígitos' });
     }
@@ -63,7 +66,7 @@ router.post('/', async (req, res, next) => {
       return res.status(409).json({ error: 'Ese usuario o esa extensión ya existen' });
     }
 
-    /* 3. Cifrar la contraseña */
+    /* 3. Cifrar la contraseña temporal */
     const clave_hash = await auth.cifrarClave(clave);
 
     /* 4. Escribir en la plataforma Y en Asterisk, todo o nada */
@@ -144,7 +147,8 @@ router.put('/:id/clave', async (req, res, next) => {
     const u = await bd.una('SELECT nombre FROM usuario WHERE id = ?', [id]);
     if (!u) return res.status(404).json({ error: 'El usuario no existe' });
 
-    await bd.consultar('UPDATE usuario SET clave_hash = ? WHERE id = ?',
+    await bd.consultar(
+      'UPDATE usuario SET clave_hash = ?, debe_cambiar_clave = TRUE WHERE id = ?',
       [await auth.cifrarClave(clave), id]);
 
     /* Se cierran sus sesiones abiertas: si alguien le robó el token,
@@ -159,6 +163,32 @@ router.put('/:id/clave', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+
+/* ── Restablecer la contraseña ───────────────────────────────────
+   Deja al usuario con la temporal y le vuelve a exigir el cambio.
+   Es lo que se usa cuando alguien olvida la suya.                  */
+router.post('/:id/restablecer', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+
+    const u = await bd.una('SELECT nombre FROM usuario WHERE id = ?', [id]);
+    if (!u) return res.status(404).json({ error: 'El usuario no existe' });
+
+    await bd.consultar(
+      'UPDATE usuario SET clave_hash = ?, debe_cambiar_clave = TRUE WHERE id = ?',
+      [await auth.cifrarClave(CONFIG.claveTemporal), id]
+    );
+
+    /* Se cierran sus sesiones abiertas */
+    await bd.consultar(
+      'UPDATE sesion SET cerrada = NOW() WHERE usuario_id = ? AND cerrada IS NULL', [id]);
+
+    await auth.auditar(req.usuario.id, 'modificar', 'usuario', id,
+      `Restableció la contraseña de ${u.nombre}`, req.ip);
+
+    res.json({ ok: true, claveTemporal: CONFIG.claveTemporal });
+  } catch (e) { next(e); }
+});
 
 /* ── Desactivar ──────────────────────────────────────────────────────
    No se borra: se desactiva. Borrarlo dejaría sus llamadas e

@@ -106,4 +106,37 @@ async function asignarCola(cx, extension, cola, agregar = true) {
   return { ok: true };
 }
 
-module.exports = { crearExtension, cambiarClave, eliminarExtension, asignarCola };
+/* ── Colas de campaña ────────────────────────────────────────────
+   La cola es lo que reparte las llamadas entrantes entre los agentes
+   de una campaña.
+
+   wrapuptime es el tiempo que la cola espera antes de entregarle otra
+   llamada al mismo agente. Debe coincidir con el tiempo de cierre de
+   la plataforma, o el agente recibiría una llamada nueva mientras
+   todavía está tipificando la anterior.                              */
+
+async function crearCola(cx, { nombre, wrapuptime = 60, estrategia = 'rrmemory' }) {
+  if (!CONFIG.realtime) return { creada: false, motivo: 'Realtime desactivado' };
+
+  await cx.execute(
+    `INSERT INTO queues (name, strategy, timeout, wrapuptime, maxlen,
+                         ringinuse, joinempty, leavewhenempty)
+     VALUES (?, ?, 15, ?, 0, 'no', 'yes', 'no')
+     ON DUPLICATE KEY UPDATE strategy = VALUES(strategy),
+                             wrapuptime = VALUES(wrapuptime)`,
+    [nombre, estrategia, wrapuptime]
+  );
+  return { creada: true };
+}
+
+async function eliminarCola(cx, nombre) {
+  if (!CONFIG.realtime) return { ok: false };
+  await cx.execute('DELETE FROM queue_members WHERE queue_name = ?', [nombre]);
+  await cx.execute('DELETE FROM queues WHERE name = ?', [nombre]);
+  return { ok: true };
+}
+
+module.exports = {
+  crearExtension, cambiarClave, eliminarExtension,
+  asignarCola, crearCola, eliminarCola,
+};
