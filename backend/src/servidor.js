@@ -56,6 +56,8 @@ app.get('/api/salud', async (req, res) => {
 
 app.use('/api/sesion', require('./rutas/sesion'));
 app.use('/api/usuarios', require('./rutas/usuarios'));
+app.use('/api/grabaciones', require('./rutas/grabaciones'));
+app.use('/api', require('./rutas/vivo'));
 app.use('/api', require('./rutas/operacion'));
 
 

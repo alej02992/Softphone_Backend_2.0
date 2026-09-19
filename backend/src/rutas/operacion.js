@@ -278,7 +278,10 @@ router.get('/pausas/tipos', async (req, res, next) => {
 
 router.post('/pausas', async (req, res, next) => {
   try {
-    const { pausa_tipo_id } = req.body;
+    /* La plataforma envía el nombre de la pausa, no un identificador.
+       Es lo natural desde el navegador y además permite los estados
+       personalizados, donde el agente escribe su propio motivo. */
+    const { tipo, entrando, pausa_tipo_id } = req.body;
 
     /* Se cierra cualquier pausa abierta antes de empezar otra */
     await bd.consultar(
@@ -286,13 +289,39 @@ router.post('/pausas', async (req, res, next) => {
       [req.usuario.id]
     );
 
-    if (!pausa_tipo_id) return res.json({ ok: true, disponible: true });
+    /* Volver a disponible: no se abre pausa nueva */
+    if (entrando === false || (!tipo && !pausa_tipo_id)) {
+      return res.json({ ok: true, disponible: true });
+    }
+
+    let tipoId = pausa_tipo_id;
+
+    if (!tipoId) {
+      const nombre = String(tipo).trim().slice(0, 60);
+      if (nombre.length < 3) {
+        return res.status(400).json({ error: 'El motivo de la pausa es demasiado corto' });
+      }
+
+      const existe = await bd.una('SELECT id FROM pausa_tipo WHERE nombre = ?', [nombre]);
+
+      if (existe) {
+        tipoId = existe.id;
+      } else {
+        /* Estado personalizado: se registra como un tipo más, para que
+           aparezca en los reportes con el nombre que escribió el
+           agente en lugar de perderse. */
+        const [ins] = await bd.pool.execute(
+          'INSERT INTO pausa_tipo (nombre, productiva) VALUES (?, FALSE)', [nombre]);
+        tipoId = ins.insertId;
+      }
+    }
 
     const [r] = await bd.pool.execute(
       'INSERT INTO pausa (usuario_id, pausa_tipo_id, inicio) VALUES (?, ?, NOW())',
-      [req.usuario.id, pausa_tipo_id]
+      [req.usuario.id, tipoId]
     );
-    res.status(201).json({ id: r.insertId });
+
+    res.status(201).json({ id: r.insertId, pausa_tipo_id: tipoId });
   } catch (e) { next(e); }
 });
 
