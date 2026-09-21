@@ -171,6 +171,36 @@ router.get('/', auth.exigirSesion, auth.exigir('grabaciones'), async (req, res, 
   } catch (e) { next(e); }
 });
 
+/* ═══════════ AGENTES CON GRABACIONES ═══════════
+
+   Llena el desplegable del filtro. Se arma con las extensiones que
+   aparecen en las grabaciones y no con la lista de usuarios, porque
+   esa requiere permiso de administración y el supervisor no lo tiene.
+
+   Va antes de la ruta /:archivo: si no, Express tomaría "agentes" como
+   el nombre de un archivo.                                           */
+
+router.get('/agentes', auth.exigirSesion, auth.exigir('grabaciones'), async (req, res, next) => {
+  try {
+    const { archivos } = await listarArchivos();
+    const permitidas = await extensionesPermitidas(req.usuario);
+
+    const exts = [...new Set(archivos.map((g) => g.extension))]
+      .filter((e) => !permitidas || permitidas.includes(e));
+
+    const nombres = exts.length
+      ? await bd.consultar(
+          `SELECT extension, nombre FROM usuario WHERE extension IN (${exts.map(() => '?').join(',')})`,
+          exts)
+      : [];
+    const porExt = Object.fromEntries(nombres.map((n) => [n.extension, n.nombre]));
+
+    res.json(exts
+      .map((e) => ({ extension: e, agente: porExt[e] || 'Extensión ' + e }))
+      .sort((a, b) => a.agente.localeCompare(b.agente)));
+  } catch (e) { next(e); }
+});
+
 /* ═══════════ REPRODUCIR Y DESCARGAR ═══════════ */
 
 /* El navegador pide el audio por este camino. Se comprueba el permiso

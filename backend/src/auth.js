@@ -62,7 +62,13 @@ function crearToken(usuario, sesionId) {
  */
 async function exigirSesion(req, res, next) {
   const cabecera = req.headers.authorization || '';
-  const token = cabecera.startsWith('Bearer ') ? cabecera.slice(7) : null;
+
+  /* Lo normal es la cabecera. Pero el elemento <audio> del navegador no
+     permite añadir cabeceras, así que para reproducir grabaciones el
+     token se acepta también por la dirección. */
+  const token = cabecera.startsWith('Bearer ')
+    ? cabecera.slice(7)
+    : (req.query && req.query.token) || null;
 
   if (!token) {
     return res.status(401).json({ error: 'Falta iniciar sesión' });
