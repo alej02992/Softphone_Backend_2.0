@@ -122,6 +122,35 @@ router.put('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'), a
   } catch (e) { next(e); }
 });
 
+/* ═══════════ ELIMINAR ═══════════
+   Solo si nunca se usó. Si ya tiene pausas registradas, borrarlo se
+   llevaría esas filas y los reportes de productividad quedarían
+   incompletos: en ese caso se desactiva, que lo quita de la vista de
+   los agentes sin perder el historial. */
+router.delete('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const t = await bd.una('SELECT nombre FROM pausa_tipo WHERE id = ?', [id]);
+      if (!t) return res.status(404).json({ error: 'El estado no existe' });
+
+      const uso = await bd.una('SELECT COUNT(*) AS n FROM pausa WHERE pausa_tipo_id = ?', [id]);
+      if (uso.n > 0) {
+        return res.status(409).json({
+          error: `"${t.nombre}" ya se usó ${uso.n} vez/veces. No se puede eliminar sin perder ` +
+                 'ese historial: desactívalo y dejará de aparecer a los agentes.',
+          usos: uso.n,
+        });
+      }
+
+      await bd.consultar('DELETE FROM pausa_tipo WHERE id = ?', [id]);
+      await auth.auditar(req.usuario.id, 'eliminar', 'pausa_tipo', id,
+        `Eliminó el estado "${t.nombre}"`, req.ip);
+
+      res.json({ ok: true });
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ ENTRAR O SALIR DE PAUSA ═══════════
    Reemplaza la ruta de operacion.js. La diferencia: solo acepta
    estados que existan y estén activos. */
