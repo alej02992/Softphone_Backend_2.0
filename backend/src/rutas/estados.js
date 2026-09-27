@@ -20,6 +20,48 @@ const auth = require('../auth');
 
 const router = express.Router();
 
+/* ═══════════ A QUÉ CAMPAÑAS ALCANZA CADA QUIEN ═══════════
+
+   El administrador manda sobre todas. El supervisor, solo sobre las
+   suyas: las de la tabla `usuario_campana` y, si no tiene ninguna
+   asignada ahí, la de su ficha.
+
+   Devuelve null cuando no hay límite (administrador). */
+async function campanasDe(usuario) {
+  if (usuario.rol === 'admin') return null;
+
+  const filas = await bd.consultar(
+    'SELECT campana_id FROM usuario_campana WHERE usuario_id = ?', [usuario.id]);
+  const ids = filas.map((f) => f.campana_id);
+
+  if (!ids.length) {
+    const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [usuario.id]);
+    if (yo?.campana_id) ids.push(yo.campana_id);
+  }
+  return ids;
+}
+
+/* Las campañas sobre las que puede crear estados. El desplegable de la
+   plataforma se llena con esto. */
+router.get('/pausas/campanas', auth.exigirSesion, auth.exigir('supervision'),
+  async (req, res, next) => {
+    try {
+      const mias = await campanasDe(req.usuario);
+
+      if (mias === null) {
+        const todas = await bd.consultar(
+          'SELECT id, nombre FROM campana WHERE activa = TRUE ORDER BY nombre');
+        return res.json({ general: true, campanas: todas });
+      }
+      if (!mias.length) return res.json({ general: false, campanas: [] });
+
+      const campanas = await bd.consultar(
+        `SELECT id, nombre FROM campana WHERE activa = TRUE AND id IN (${mias.map(() => '?').join(',')}) ORDER BY nombre`,
+        mias);
+      res.json({ general: false, campanas });
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ LISTAR ═══════════
    Cualquier usuario con sesión: el agente la usa para pintar sus
    botones. El supervisor pide también los inactivos con ?todos=1. */
@@ -46,11 +88,34 @@ router.get('/pausas/tipos', auth.exigirSesion, async (req, res, next) => {
     sql += ' ORDER BY t.campana_id IS NULL DESC, t.id';
 
     const filas = await bd.consultar(sql, val);
+    const mias = todos ? await campanasDe(req.usuario) : null;
+
     res.json(filas.map((f) => ({
-      ...f, activo: !!f.activo, productiva: !!f.productiva,
+      ...f,
+      activo: !!f.activo,
+      productiva: !!f.productiva,
+      /* El supervisor ve los estados generales para entender por qué
+         sus agentes tienen esos botones, pero no puede modificarlos:
+         afectarían a campañas que no son suyas. */
+      editable: mias === null ? true : (!!f.campana_id && mias.includes(f.campana_id)),
     })));
   } catch (e) { next(e); }
 });
+
+/** Comprueba si el usuario puede modificar o eliminar un estado.
+    Devuelve el motivo del rechazo, o null si puede. */
+async function puedeTocar(usuario, estado) {
+  const mias = await campanasDe(usuario);
+  if (mias === null) return null;                 // administrador
+
+  if (!estado.campana_id) {
+    return 'Ese estado es general: solo el administrador puede cambiarlo.';
+  }
+  if (!mias.includes(estado.campana_id)) {
+    return 'Ese estado es de otra campaña.';
+  }
+  return null;
+}
 
 /* ═══════════ CREAR ═══════════ */
 router.post('/pausas/tipos', auth.exigirSesion, auth.exigir('supervision'), async (req, res, next) => {
@@ -67,6 +132,22 @@ router.post('/pausas/tipos', auth.exigirSesion, auth.exigir('supervision'), asyn
 
     /* Una campaña concreta o NULL para todas */
     const campana_id = Number(req.body.campana_id) || null;
+    const mias = await campanasDe(req.usuario);
+
+    if (mias !== null) {
+      /* Supervisor: solo para sus campañas, nunca para todas */
+      if (!campana_id) {
+        return res.status(403).json({
+          error: 'Solo el administrador puede crear estados para todas las campañas. Elige una de las tuyas.' });
+      }
+      if (!mias.length) {
+        return res.status(403).json({
+          error: 'No tienes campañas asignadas. Pídele al administrador que te asigne una.' });
+      }
+      if (!mias.includes(campana_id)) {
+        return res.status(403).json({ error: 'Esa campaña no está a tu cargo' });
+      }
+    }
 
     if (campana_id) {
       const c = await bd.una('SELECT id FROM campana WHERE id = ? AND activa = TRUE', [campana_id]);
@@ -101,8 +182,11 @@ router.post('/pausas/tipos', auth.exigirSesion, auth.exigir('supervision'), asyn
 router.put('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const t = await bd.una('SELECT nombre FROM pausa_tipo WHERE id = ?', [id]);
+    const t = await bd.una('SELECT nombre, campana_id FROM pausa_tipo WHERE id = ?', [id]);
     if (!t) return res.status(404).json({ error: 'El estado no existe' });
+
+    const puede = await puedeTocar(req.usuario, t);
+    if (puede) return res.status(403).json({ error: puede });
 
     const activo = req.body.activo === undefined ? undefined : !!req.body.activo;
     const campana_id = req.body.campana_id === undefined
@@ -131,8 +215,11 @@ router.delete('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision')
   async (req, res, next) => {
     try {
       const id = Number(req.params.id);
-      const t = await bd.una('SELECT nombre FROM pausa_tipo WHERE id = ?', [id]);
+      const t = await bd.una('SELECT nombre, campana_id FROM pausa_tipo WHERE id = ?', [id]);
       if (!t) return res.status(404).json({ error: 'El estado no existe' });
+
+      const puede = await puedeTocar(req.usuario, t);
+      if (puede) return res.status(403).json({ error: puede });
 
       const uso = await bd.una('SELECT COUNT(*) AS n FROM pausa WHERE pausa_tipo_id = ?', [id]);
       if (uso.n > 0) {
