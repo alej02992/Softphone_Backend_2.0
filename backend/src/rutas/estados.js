@@ -167,14 +167,23 @@ router.post('/pausas/tipos', auth.exigirSesion, auth.exigir('supervision'), asyn
           : `Ya existe el estado general "${nombre}", que ven todas las campañas.` });
     }
 
+    /* Duración máxima en minutos. NULL o 0 = sin límite: hay estados
+       que no deben tenerlo, como una capacitación larga. */
+    let limite = Number(req.body.limite_minutos);
+    if (!Number.isFinite(limite) || limite <= 0) limite = null;
+    else if (limite > 480) {
+      return res.status(400).json({ error: 'La duración máxima son 480 minutos (8 horas)' });
+    }
+
     const [r] = await bd.pool.execute(
-      'INSERT INTO pausa_tipo (nombre, productiva, activo, campana_id, creado_por) VALUES (?, FALSE, ?, ?, ?)',
-      [nombre, activo, campana_id, req.usuario.id]);
+      `INSERT INTO pausa_tipo (nombre, productiva, activo, campana_id, creado_por, limite_minutos)
+       VALUES (?, FALSE, ?, ?, ?, ?)`,
+      [nombre, activo, campana_id, req.usuario.id, limite]);
 
     await auth.auditar(req.usuario.id, 'crear', 'pausa_tipo', r.insertId,
       `Creó el estado "${nombre}"${campana_id ? ' para una campaña' : ' para todas las campañas'}`, req.ip);
 
-    res.status(201).json({ id: r.insertId, nombre, activo, campana_id });
+    res.status(201).json({ id: r.insertId, nombre, activo, campana_id, limite_minutos: limite });
   } catch (e) { next(e); }
 });
 
@@ -197,6 +206,11 @@ router.put('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'), a
     }
     if (campana_id !== undefined) {
       await bd.consultar('UPDATE pausa_tipo SET campana_id = ? WHERE id = ?', [campana_id, id]);
+    }
+    if (req.body.limite_minutos !== undefined) {
+      let lim = Number(req.body.limite_minutos);
+      if (!Number.isFinite(lim) || lim <= 0) lim = null;
+      await bd.consultar('UPDATE pausa_tipo SET limite_minutos = ? WHERE id = ?', [lim, id]);
     }
 
     await auth.auditar(req.usuario.id, 'modificar', 'pausa_tipo', id,
@@ -238,6 +252,48 @@ router.delete('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision')
     } catch (e) { next(e); }
   });
 
+/* ═══════════ QUIÉNES SE PASARON DEL TIEMPO ═══════════
+
+   Devuelve los agentes que llevan en pausa más de lo que dura ese
+   estado. El supervisor solo ve a los de sus campañas.
+
+   El cálculo se hace aquí y no en la plataforma: así todos ven lo
+   mismo, sin depender del reloj del equipo de cada quien. */
+router.get('/pausas/excedidas', auth.exigirSesion, auth.exigir('supervision'),
+  async (req, res, next) => {
+    try {
+      const mias = await campanasDe(req.usuario);
+
+      let sql = `SELECT u.id, u.nombre, u.extension, u.campana_id,
+                        c.nombre AS campana, pt.nombre AS estado,
+                        pt.limite_minutos, p.inicio,
+                        TIMESTAMPDIFF(SECOND, p.inicio, NOW()) AS segundos
+                   FROM pausa p
+                   JOIN usuario u   ON u.id = p.usuario_id
+                   JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
+                   LEFT JOIN campana c ON c.id = u.campana_id
+                  WHERE p.fin IS NULL
+                    AND pt.limite_minutos IS NOT NULL
+                    AND TIMESTAMPDIFF(SECOND, p.inicio, NOW()) > pt.limite_minutos * 60`;
+      const val = [];
+
+      if (mias !== null) {
+        if (!mias.length) return res.json([]);
+        sql += ` AND u.campana_id IN (${mias.map(() => '?').join(',')})`;
+        val.push(...mias);
+      }
+
+      sql += ' ORDER BY segundos DESC';
+
+      const filas = await bd.consultar(sql, val);
+      res.json(filas.map((f) => ({
+        ...f,
+        segundos: Number(f.segundos),
+        excedido: Number(f.segundos) - f.limite_minutos * 60,
+      })));
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ ENTRAR O SALIR DE PAUSA ═══════════
    Reemplaza la ruta de operacion.js. La diferencia: solo acepta
    estados que existan y estén activos. */
@@ -255,7 +311,7 @@ router.post('/pausas', auth.exigirSesion, async (req, res, next) => {
        comprueba aquí porque la pantalla se puede saltar. */
     const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
     const t = await bd.una(
-      `SELECT id FROM pausa_tipo
+      `SELECT id, limite_minutos FROM pausa_tipo
         WHERE nombre = ? AND activo = TRUE
           AND (campana_id IS NULL OR campana_id = ?)
         LIMIT 1`,
@@ -270,7 +326,9 @@ router.post('/pausas', auth.exigirSesion, async (req, res, next) => {
       'INSERT INTO pausa (usuario_id, pausa_tipo_id, inicio) VALUES (?, ?, NOW())',
       [req.usuario.id, t.id]);
 
-    res.status(201).json({ id: r.insertId });
+    /* El límite viaja de vuelta: con él la plataforma del agente avisa
+       dos minutos antes de que se le acabe el tiempo. */
+    res.status(201).json({ id: r.insertId, limite_minutos: t.limite_minutos });
   } catch (e) { next(e); }
 });
 
