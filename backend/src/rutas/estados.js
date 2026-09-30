@@ -65,8 +65,32 @@ router.get('/pausas/campanas', auth.exigirSesion, auth.exigir('supervision'),
 /* ═══════════ LISTAR ═══════════
    Cualquier usuario con sesión: el agente la usa para pintar sus
    botones. El supervisor pide también los inactivos con ?todos=1. */
+/** Cierra las pausas que quedaron abiertas de una sesión anterior.
+
+    Si alguien cierra sesión —o se le vence— mientras está en pausa,
+    esa fila se queda sin `fin` y el agente aparece en ese estado para
+    siempre. Se limpian aquí porque el agente pide sus estados justo
+    después de entrar. */
+async function cerrarPausasHuerfanas(usuarioId) {
+  await bd.consultar(
+    `UPDATE pausa p
+        SET p.fin = COALESCE(
+              (SELECT MAX(s.cerrada) FROM sesion s
+                WHERE s.usuario_id = p.usuario_id AND s.cerrada IS NOT NULL
+                  AND s.cerrada > p.inicio),
+              p.inicio)
+      WHERE p.usuario_id = ?
+        AND p.fin IS NULL
+        AND p.inicio < COALESCE(
+              (SELECT MIN(s.inicio) FROM sesion s
+                WHERE s.usuario_id = p.usuario_id AND s.cerrada IS NULL AND s.vence > NOW()),
+              NOW())`,
+    [usuarioId]);
+}
+
 router.get('/pausas/tipos', auth.exigirSesion, async (req, res, next) => {
   try {
+    await cerrarPausasHuerfanas(req.usuario.id);
     /* El supervisor pide la lista completa para administrarla; el
        agente recibe solo los estados activos que le corresponden: los
        generales y los de su campaña. */
@@ -274,7 +298,13 @@ router.get('/pausas/excedidas', auth.exigirSesion, auth.exigir('supervision'),
                    LEFT JOIN campana c ON c.id = u.campana_id
                   WHERE p.fin IS NULL
                     AND pt.limite_minutos IS NOT NULL
-                    AND TIMESTAMPDIFF(SECOND, p.inicio, NOW()) > pt.limite_minutos * 60`;
+                    AND TIMESTAMPDIFF(SECOND, p.inicio, NOW()) > pt.limite_minutos * 60
+                    /* Solo cuenta si la persona tiene la sesión abierta: una
+                       pausa sin sesión es un resto de un turno anterior, no
+                       alguien que se pasó del tiempo. */
+                    AND EXISTS (SELECT 1 FROM sesion s
+                                 WHERE s.usuario_id = u.id AND s.cerrada IS NULL
+                                   AND s.vence > NOW() AND s.inicio <= p.inicio)`;
       const val = [];
 
       if (mias !== null) {
