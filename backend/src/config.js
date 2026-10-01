@@ -53,6 +53,12 @@ const CONFIG = {
      El proveedor se elige aquí: si mañana cambia, no se toca el código.
      Con un servicio en la nube, el texto del mensaje sale del servidor,
      así que conviene revisarlo con jurídico antes de usar datos reales. */
+
+     grabaciones: {
+      ruta: process.env.GRABACIONES_RUTA || '/var/spool/asterisk/monitor',
+      minimoBytes: Number(process.env.GRABACIONES_MINIMO) || 10240,
+     },
+
   tts: {
     proveedor:     process.env.TTS_PROVEEDOR || 'ninguno',
     clave:         process.env.TTS_CLAVE || '',
