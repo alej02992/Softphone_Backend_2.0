@@ -23,16 +23,12 @@ const CONFIG = {
     base: process.env.BD_BASE || 'bpm_contact',
   },
 
-  /* ── Contraseña temporal ──
-     La que se asigna al crear un usuario y al restablecer. La persona
-     la cambia obligatoriamente en su primer acceso, así que no hace
-     falta que sea secreta, pero sí que no sea adivinable.           */
-  claveTemporal: process.env.CLAVE_TEMPORAL || 'BpmTemp2026#',
-
   /* ── Sesiones ──
      La clave firma los tokens. Si alguien la conoce puede fabricar
      sesiones falsas, así que en el servidor debe ser larga y aleatoria:
      openssl rand -base64 48                                            */
+  claveTemporal: process.env.CLAVE_TEMPORAL || 'BpmTemp2026',
+
   jwt: {
     clave: process.env.JWT_CLAVE || 'cambiar-esta-clave-en-produccion',
     duracion: process.env.JWT_DURACION || '8h',   // un turno
@@ -53,6 +49,18 @@ const CONFIG = {
              ps_endpoints, ps_auths y ps_aors de Asterisk.
      false → solo se crea el usuario en la plataforma; la extensión hay
              que crearla a mano en VitalPBX.                            */
+  /* ── Voz sintética para los blasters ──
+     El proveedor se elige aquí: si mañana cambia, no se toca el código.
+     Con un servicio en la nube, el texto del mensaje sale del servidor,
+     así que conviene revisarlo con jurídico antes de usar datos reales. */
+  tts: {
+    proveedor:     process.env.TTS_PROVEEDOR || 'ninguno',
+    clave:         process.env.TTS_CLAVE || '',
+    vozPorDefecto: process.env.TTS_VOZ || '',
+    modelo:        process.env.TTS_MODELO || 'eleven_multilingual_v2',
+    carpeta:       process.env.TTS_CARPETA || '/var/lib/asterisk/sounds/blaster',
+  },
+
   realtime: process.env.REALTIME === 'true',
 };
 
