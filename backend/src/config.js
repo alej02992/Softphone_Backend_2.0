@@ -65,6 +65,24 @@ const CONFIG = {
     vozPorDefecto: process.env.TTS_VOZ || '',
     modelo:        process.env.TTS_MODELO || 'eleven_multilingual_v2',
     carpeta:       process.env.TTS_CARPETA || '/var/lib/asterisk/sounds/blaster',
+    /* Ruta del programa Piper cuando TTS_PROVEEDOR=piper */
+    piper:         process.env.TTS_PIPER || 'piper',
+  },
+
+  /* ── Envío de SMS ──
+     El proveedor entrega los mensajes; la plataforma los prepara y los
+     registra. La clave solo vive aquí, nunca viaja al navegador. */
+  sms: {
+    proveedor:    process.env.SMS_PROVEEDOR || 'ninguno',
+    clave:        process.env.SMS_CLAVE || '',
+    cabecera:     process.env.SMS_CABECERA || 'X-Hablame-Key',
+    url:          process.env.SMS_URL || 'https://www.hablame.co/api/sms/v5/send',
+    remitente:    process.env.SMS_REMITENTE || '',
+    /* Los mensajes certificados tienen validez jurídica y cuestan
+       más. Apagados por defecto: se encienden a propósito. */
+    certificados: process.env.SMS_CERTIFICADOS === 'true',
+    /* Clave propia para que el proveedor nos avise de las entregas */
+    claveEntrega: process.env.SMS_CLAVE_ENTREGA || '',
   },
 
   realtime: process.env.REALTIME === 'true',
