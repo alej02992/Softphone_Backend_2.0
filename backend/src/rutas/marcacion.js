@@ -1,0 +1,593 @@
+/* ═══════════════════════════════════════════════════════════════════
+   MOTOR DE MARCACIÓN
+
+   El supervisor carga una base de contactos y la activa. Los agentes de
+   esa campaña reciben los contactos uno por uno: gestionan, tipifican, y
+   aparece el siguiente.
+
+   EL PUNTO DELICADO: EL REPARTO
+   Si dos agentes quedan libres al mismo tiempo, los dos piden el
+   siguiente contacto en el mismo instante. Si se hiciera "buscar y
+   luego marcar como asignado" en dos pasos, ambos podrían recibir el
+   mismo y el cliente recibiría dos llamadas.
+
+   Por eso se hace al revés: primero se MARCA como asignado con un
+   UPDATE —que bloquea la fila mientras se ejecuta— y solo después se
+   lee. Quien llega segundo ya no encuentra esa fila libre y se lleva la
+   siguiente. Es la misma idea de tomar un número en una fila: primero
+   agarras el papel, después lees qué número te tocó.
+
+   CONTACTOS ABANDONADOS
+   Si un agente recibe un contacto y se desconecta sin gestionarlo, esa
+   fila quedaría asignada para siempre. Por eso, antes de cada reparto,
+   se devuelven a la cola los que llevan demasiado tiempo asignados sin
+   resolverse.
+   ═══════════════════════════════════════════════════════════════════ */
+'use strict';
+
+const express = require('express');
+const bd = require('../bd');
+const auth = require('../auth');
+
+const router = express.Router();
+
+/* Cuántos minutos puede tener un agente un contacto asignado antes de
+   que se considere abandonado y vuelva a la cola. */
+const MINUTOS_ABANDONO = 15;
+
+/* ═══════════ A QUÉ CAMPAÑAS ALCANZA CADA QUIEN ═══════════ */
+
+async function campanasDe(usuario) {
+  if (usuario.rol === 'admin') return null;
+  const filas = await bd.consultar(
+    'SELECT campana_id FROM usuario_campana WHERE usuario_id = ?', [usuario.id]);
+  const ids = filas.map((f) => f.campana_id);
+  if (!ids.length) {
+    const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [usuario.id]);
+    if (yo?.campana_id) ids.push(yo.campana_id);
+  }
+  return ids;
+}
+
+async function puedeCon(usuario, campanaId) {
+  const mias = await campanasDe(usuario);
+  if (mias === null) return null;
+  if (!mias.length) return 'No tienes campañas asignadas. Pídeselo al administrador.';
+  if (!mias.includes(Number(campanaId))) return 'Esa campaña no está a tu cargo';
+  return null;
+}
+
+/* ═══════════ BASES ═══════════ */
+
+router.get('/bases', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
+  try {
+    const mias = await campanasDe(req.usuario);
+
+    let sql = `SELECT b.id, b.nombre, b.campana_id, c.nombre AS campana, b.estado,
+                      b.reintentos, b.intervalo_min, b.hora_inicio, b.hora_fin, b.dias, b.creado,
+                      (SELECT COUNT(*) FROM base_contacto x WHERE x.base_id = b.id) AS total,
+                      (SELECT COUNT(*) FROM base_contacto x WHERE x.base_id = b.id AND x.estado = 'pendiente') AS pendientes,
+                      (SELECT COUNT(*) FROM base_contacto x WHERE x.base_id = b.id AND x.estado = 'gestionado') AS gestionados,
+                      (SELECT COUNT(*) FROM base_contacto x WHERE x.base_id = b.id AND x.estado = 'sin_contacto') AS sin_contacto,
+                      (SELECT COUNT(*) FROM base_contacto x WHERE x.base_id = b.id AND x.estado = 'agendado') AS agendados
+                 FROM base b LEFT JOIN campana c ON c.id = b.campana_id`;
+    const val = [];
+
+    if (mias !== null) {
+      if (!mias.length) return res.json([]);
+      sql += ` WHERE b.campana_id IN (${mias.map(() => '?').join(',')})`;
+      val.push(...mias);
+    }
+    sql += ' ORDER BY b.creado DESC';
+
+    res.json(await bd.consultar(sql, val));
+  } catch (e) { next(e); }
+});
+
+router.get('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
+  try {
+    const b = await bd.una(
+      `SELECT b.*, c.nombre AS campana FROM base b
+         LEFT JOIN campana c ON c.id = b.campana_id WHERE b.id = ?`, [Number(req.params.id)]);
+    if (!b) return res.status(404).json({ error: 'Esa base no existe' });
+
+    const no = await puedeCon(req.usuario, b.campana_id);
+    if (no) return res.status(403).json({ error: no });
+
+    res.json(b);
+  } catch (e) { next(e); }
+});
+
+function revisarBase(b) {
+  if (!b.nombre || String(b.nombre).trim().length < 3) {
+    return 'La base necesita un nombre de al menos tres caracteres';
+  }
+  if (!b.campana_id) return 'Falta la campaña';
+  const r = Number(b.reintentos);
+  if (b.reintentos !== undefined && (!Number.isInteger(r) || r < 0 || r > 5)) {
+    return 'Los reintentos deben ser un número de 0 a 5';
+  }
+  const i = Number(b.intervalo_min);
+  if (b.intervalo_min !== undefined && (!Number.isInteger(i) || i < 5 || i > 1440)) {
+    return 'El intervalo debe estar entre 5 minutos y 24 horas';
+  }
+  return null;
+}
+
+router.post('/bases', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const error = revisarBase(b);
+    if (error) return res.status(400).json({ error });
+
+    const no = await puedeCon(req.usuario, b.campana_id);
+    if (no) return res.status(403).json({ error: no });
+
+    const [r] = await bd.pool.execute(
+      `INSERT INTO base (nombre, campana_id, reintentos, intervalo_min,
+                         hora_inicio, hora_fin, dias, creado_por)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [String(b.nombre).trim(), b.campana_id, b.reintentos ?? 2, b.intervalo_min ?? 60,
+       b.hora_inicio || '08:00:00', b.hora_fin || '19:00:00',
+       b.dias || 'L,M,X,J,V', req.usuario.id]);
+
+    await auth.auditar(req.usuario.id, 'crear', 'base', r.insertId,
+      `Creó la base ${b.nombre}`, req.ip);
+
+    res.status(201).json({ id: r.insertId });
+  } catch (e) { next(e); }
+});
+
+router.put('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const actual = await bd.una('SELECT campana_id FROM base WHERE id = ?', [id]);
+    if (!actual) return res.status(404).json({ error: 'Esa base no existe' });
+
+    const no = await puedeCon(req.usuario, actual.campana_id);
+    if (no) return res.status(403).json({ error: no });
+
+    const b = req.body || {};
+    const error = revisarBase({ ...b, campana_id: b.campana_id || actual.campana_id });
+    if (error) return res.status(400).json({ error });
+
+    await bd.consultar(
+      `UPDATE base SET nombre = ?, reintentos = ?, intervalo_min = ?,
+              hora_inicio = ?, hora_fin = ?, dias = ? WHERE id = ?`,
+      [String(b.nombre).trim(), b.reintentos ?? 2, b.intervalo_min ?? 60,
+       b.hora_inicio || '08:00:00', b.hora_fin || '19:00:00', b.dias || 'L,M,X,J,V', id]);
+
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+/** Activar, pausar o terminar. Mientras está pausada no se reparte. */
+router.put('/bases/:id/estado', auth.exigirSesion, auth.exigir('marcacion'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const b = await bd.una('SELECT nombre, campana_id FROM base WHERE id = ?', [id]);
+      if (!b) return res.status(404).json({ error: 'Esa base no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const destino = String(req.body.estado || '');
+      if (!['borrador', 'activa', 'pausada', 'terminada'].includes(destino)) {
+        return res.status(400).json({ error: 'Estado no válido' });
+      }
+
+      if (destino === 'activa') {
+        const n = await bd.una(
+          "SELECT COUNT(*) AS n FROM base_contacto WHERE base_id = ? AND estado = 'pendiente'", [id]);
+        if (!n.n) {
+          return res.status(400).json({ error: 'La base no tiene contactos pendientes por llamar' });
+        }
+      }
+
+      /* Al pausar, lo que estaba asignado vuelve a la cola: nadie se
+         queda con un contacto en la mano cuando la base se detiene. */
+      if (destino !== 'activa') {
+        await bd.consultar(
+          `UPDATE base_contacto SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL
+            WHERE base_id = ? AND estado = 'asignado'`, [id]);
+      }
+
+      await bd.consultar('UPDATE base SET estado = ? WHERE id = ?', [destino, id]);
+      await auth.auditar(req.usuario.id, 'modificar', 'base', id,
+        `Pasó la base ${b.nombre} a ${destino}`, req.ip);
+
+      res.json({ ok: true, estado: destino });
+    } catch (e) { next(e); }
+  });
+
+router.delete('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const b = await bd.una('SELECT nombre, campana_id, estado FROM base WHERE id = ?', [id]);
+    if (!b) return res.status(404).json({ error: 'Esa base no existe' });
+
+    const no = await puedeCon(req.usuario, b.campana_id);
+    if (no) return res.status(403).json({ error: no });
+    if (b.estado === 'activa') {
+      return res.status(409).json({ error: 'Pausa la base antes de eliminarla' });
+    }
+
+    await bd.consultar('DELETE FROM base WHERE id = ?', [id]);
+    await auth.auditar(req.usuario.id, 'eliminar', 'base', id, `Eliminó la base ${b.nombre}`, req.ip);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+/* ═══════════ CARGAR CONTACTOS ═══════════ */
+
+const CELULAR = /^3\d{9}$/;
+const FIJO = /^(60\d{8}|\d{7})$/;
+const valido = (n) => CELULAR.test(n) || FIJO.test(n);
+
+router.post('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const b = await bd.una('SELECT campana_id, estado FROM base WHERE id = ?', [id]);
+      if (!b) return res.status(404).json({ error: 'Esa base no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const filas = Array.isArray(req.body.filas) ? req.body.filas : [];
+      const soloRevisar = req.body.revisar !== false;
+
+      if (!filas.length) return res.status(400).json({ error: 'El archivo no trae filas' });
+      if (filas.length > 10000) {
+        return res.status(400).json({ error: 'Máximo 10.000 contactos por archivo' });
+      }
+
+      /* Números que pidieron no ser llamados */
+      const excluidos = new Set(
+        (await bd.consultar('SELECT numero FROM no_llamar')).map((x) => x.numero));
+
+      /* Los que ya están en esta base, para no cargarlos dos veces */
+      const yaEstan = new Set(
+        (await bd.consultar('SELECT telefono_1 FROM base_contacto WHERE base_id = ?', [id]))
+          .map((x) => x.telefono_1));
+
+      const vistos = new Set();
+
+      const revisadas = filas.map((f, i) => {
+        const limpiar = (v) => String(v ?? '').replace(/\D/g, '');
+        const t1 = limpiar(f.telefono_1 || f.telefono || f.numero || f.celular);
+        const t2 = limpiar(f.telefono_2 || f.telefono2 || f.celular_2 || f.otro_telefono);
+        const nombre = String(f.nombre || '').trim();
+        const documento = String(f.documento || f.cedula || '').trim();
+        const errores = [];
+
+        /* Toda columna que no sea de las conocidas queda como dato
+           extra: el agente la ve en pantalla al atender. */
+        const datos = {};
+        Object.entries(f).forEach(([k, v]) => {
+          const clave = k.trim().toLowerCase();
+          if (['telefono_1', 'telefono', 'numero', 'celular', 'telefono_2', 'telefono2',
+               'celular_2', 'otro_telefono', 'nombre', 'documento', 'cedula'].includes(clave)) return;
+          if (String(v ?? '').trim()) datos[clave] = String(v).trim();
+        });
+
+        if (!t1) errores.push('Falta el teléfono');
+        else if (!valido(t1)) errores.push('El teléfono no parece válido');
+        if (t2 && !valido(t2)) errores.push('El segundo teléfono no parece válido');
+        if (t1 && vistos.has(t1)) errores.push('Ese teléfono está repetido en el archivo');
+        if (t1) vistos.add(t1);
+        if (t1 && yaEstan.has(t1)) errores.push('Ese teléfono ya está en la base');
+        if (t1 && excluidos.has(t1)) errores.push('Ese número pidió no ser llamado');
+
+        return { linea: i + 2, telefono_1: t1, telefono_2: t2 || null,
+                 nombre, documento, datos, errores };
+      });
+
+      const validas = revisadas.filter((r) => !r.errores.length);
+
+      if (soloRevisar) {
+        return res.json({
+          revisado: true,
+          total: revisadas.length,
+          correctas: validas.length,
+          conError: revisadas.length - validas.length,
+          conSegundo: validas.filter((r) => r.telefono_2).length,
+          columnas: [...new Set(validas.flatMap((r) => Object.keys(r.datos)))],
+          filas: revisadas.map(({ linea, telefono_1, telefono_2, nombre, errores }) =>
+            ({ linea, telefono_1, telefono_2, nombre, errores })),
+        });
+      }
+
+      let cargados = 0;
+      for (const r of validas) {
+        try {
+          await bd.consultar(
+            `INSERT INTO base_contacto (base_id, telefono_1, telefono_2, nombre, documento, datos)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [id, r.telefono_1, r.telefono_2, r.nombre || null, r.documento || null,
+             JSON.stringify(r.datos)]);
+          cargados++;
+        } catch { /* una fila mala no detiene las demás */ }
+      }
+
+      await auth.auditar(req.usuario.id, 'modificar', 'base', id,
+        `Cargó ${cargados} contactos`, req.ip);
+
+      res.json({ cargados, omitidos: revisadas.length - cargados });
+    } catch (e) { next(e); }
+  });
+
+/* ═══════════ EL REPARTO ═══════════ */
+
+/** Devuelve a la cola los contactos que un agente tomó y no gestionó.
+    Sin esto, un agente que cierra el navegador se lleva contactos que
+    nadie volvería a llamar. */
+async function soltarAbandonados(baseId) {
+  await bd.consultar(
+    `UPDATE base_contacto
+        SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL
+      WHERE base_id = ? AND estado = 'asignado'
+        AND asignado_en < DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+    [baseId, MINUTOS_ABANDONO]);
+}
+
+/**
+ * Entrega el siguiente contacto al agente que lo pide.
+ *
+ * Primero se marca como suyo con un UPDATE y después se lee. Hacerlo en
+ * ese orden es lo que impide que dos agentes reciban el mismo contacto:
+ * el UPDATE bloquea la fila mientras se ejecuta, así que el segundo
+ * agente ya no la encuentra libre.
+ */
+router.get('/marcacion/siguiente', auth.exigirSesion, async (req, res, next) => {
+  try {
+    const yo = await bd.una(
+      'SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
+    if (!yo?.campana_id) {
+      return res.status(400).json({ error: 'No tienes campaña asignada' });
+    }
+
+    /* La base activa de su campaña. Si hay varias, la más antigua. */
+    const base = await bd.una(
+      `SELECT id, reintentos, intervalo_min, hora_inicio, hora_fin, dias
+         FROM base WHERE campana_id = ? AND estado = 'activa'
+        ORDER BY creado LIMIT 1`, [yo.campana_id]);
+
+    if (!base) return res.json({ hay: false, motivo: 'No hay ninguna base activa' });
+
+    /* Fuera del horario no se llama a nadie */
+    const ahora = new Date();
+    const dia = ['D', 'L', 'M', 'X', 'J', 'V', 'S'][ahora.getDay()];
+    const hora = ahora.toTimeString().slice(0, 8);
+
+    if (!String(base.dias).split(',').map((d) => d.trim()).includes(dia)) {
+      return res.json({ hay: false, motivo: 'Hoy no es un día de marcación para esta base' });
+    }
+    if (hora < base.hora_inicio || hora > base.hora_fin) {
+      return res.json({
+        hay: false,
+        motivo: `Fuera del horario de la base (${base.hora_inicio.slice(0, 5)} a ${base.hora_fin.slice(0, 5)})`,
+      });
+    }
+
+    await soltarAbandonados(base.id);
+
+    /* Un agente solo puede tener UN contacto a la vez. Si ya tiene uno
+       asignado —porque recargó la página o pidió dos veces seguidas— se
+       le devuelve ese mismo, no otro. Sin esta regla se iría quedando
+       con contactos que nadie más podría llamar. */
+    const yaTiene = await bd.una(
+      `SELECT id FROM base_contacto
+        WHERE agente_id = ? AND estado = 'asignado' LIMIT 1`, [req.usuario.id]);
+
+    /* ── El reparto ──
+       Se toma primero y se lee después. El orden pone adelante lo
+       agendado que ya venció, y después lo que lleva más tiempo
+       esperando. */
+    let idContacto = yaTiene?.id;
+
+    if (!idContacto) {
+      const [tomado] = await bd.pool.execute(
+        `UPDATE base_contacto
+            SET estado = 'asignado', agente_id = ?, asignado_en = NOW()
+          WHERE base_id = ?
+            AND estado IN ('pendiente', 'agendado')
+            AND (proximo_intento IS NULL OR proximo_intento <= NOW())
+            AND (agendado_para IS NULL OR agendado_para <= NOW())
+          ORDER BY (agendado_para IS NOT NULL) DESC, agendado_para ASC, id ASC
+          LIMIT 1`,
+        [req.usuario.id, base.id]);
+
+      /* Se lee la fila que acaba de quedar marcada como suya. Como el
+         agente no tenía ninguna, esta es necesariamente la que tomó. */
+      if (tomado.affectedRows) {
+        const reciente = await bd.una(
+          `SELECT id FROM base_contacto
+            WHERE agente_id = ? AND estado = 'asignado'
+            ORDER BY asignado_en DESC, id DESC LIMIT 1`, [req.usuario.id]);
+        idContacto = reciente?.id;
+      }
+    }
+
+    if (!idContacto) {
+      const quedan = await bd.una(
+        `SELECT COUNT(*) AS n FROM base_contacto
+          WHERE base_id = ? AND estado IN ('pendiente','agendado')`, [base.id]);
+      return res.json({
+        hay: false,
+        motivo: quedan.n
+          ? 'Los contactos que quedan están esperando su reintento o su hora agendada'
+          : 'No quedan contactos por llamar en esta base',
+      });
+    }
+
+    const c = await bd.una(
+      `SELECT id, telefono_1, telefono_2, nombre, documento, datos,
+              intentos, ultimo_intento, agendado_para
+         FROM base_contacto WHERE id = ?`, [idContacto]);
+
+    /* Si ya se intentó con el primer teléfono y hay segundo, se marca
+       cuál usar para que el agente no repita el mismo número. */
+    const telefono = (c.intentos > 0 && c.telefono_2) ? c.telefono_2 : c.telefono_1;
+
+    res.json({
+      hay: true,
+      base: { id: base.id, reintentos: base.reintentos },
+      contacto: {
+        ...c,
+        datos: typeof c.datos === 'string' ? JSON.parse(c.datos || '{}') : (c.datos || {}),
+        telefono,
+        usandoSegundo: telefono === c.telefono_2,
+      },
+    });
+  } catch (e) { next(e); }
+});
+
+/** Devuelve el contacto a la cola sin gestionarlo: el agente se va a
+    pausa o cierra sesión. */
+router.post('/marcacion/soltar', auth.exigirSesion, async (req, res, next) => {
+  try {
+    await bd.consultar(
+      `UPDATE base_contacto SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL
+        WHERE agente_id = ? AND estado = 'asignado'`, [req.usuario.id]);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+/* ═══════════ RESULTADO DE LA GESTIÓN ═══════════ */
+
+router.post('/marcacion/contactos/:id/resultado', auth.exigirSesion,
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const c = await bd.una(
+        `SELECT c.*, b.reintentos, b.intervalo_min
+           FROM base_contacto c JOIN base b ON b.id = c.base_id
+          WHERE c.id = ?`, [id]);
+      if (!c) return res.status(404).json({ error: 'Ese contacto no existe' });
+
+      /* Solo quien lo tiene asignado puede cerrarlo */
+      if (c.agente_id !== req.usuario.id) {
+        return res.status(403).json({ error: 'Ese contacto no está asignado a ti' });
+      }
+
+      const tipo = String(req.body.tipo || '');
+      const resultado = String(req.body.resultado || '').slice(0, 160) || null;
+      const observaciones = String(req.body.observaciones || '').slice(0, 2000) || null;
+
+      /* ── Gestionado: se habló con la persona ── */
+      if (tipo === 'gestionado') {
+        await bd.consultar(
+          `UPDATE base_contacto
+              SET estado = 'gestionado', resultado = ?, observaciones = ?,
+                  intentos = intentos + 1, ultimo_intento = NOW(), gestionado_en = NOW()
+            WHERE id = ?`, [resultado, observaciones, id]);
+        return res.json({ ok: true, estado: 'gestionado' });
+      }
+
+      /* ── Agendado: el cliente pidió que lo llamen después ── */
+      if (tipo === 'agendado') {
+        const cuando = new Date(req.body.agendado_para);
+        if (isNaN(cuando)) return res.status(400).json({ error: 'Falta la fecha del agendamiento' });
+        if (cuando <= new Date()) {
+          return res.status(400).json({ error: 'La fecha agendada debe ser posterior a ahora' });
+        }
+
+        await bd.consultar(
+          `UPDATE base_contacto
+              SET estado = 'agendado', agendado_para = ?, resultado = ?, observaciones = ?,
+                  intentos = intentos + 1, ultimo_intento = NOW(),
+                  agente_id = NULL, asignado_en = NULL, proximo_intento = NULL
+            WHERE id = ?`,
+          [cuando, resultado || 'Agendado', observaciones, id]);
+        return res.json({ ok: true, estado: 'agendado', agendado_para: cuando });
+      }
+
+      /* ── No contestó ──
+         Se cuenta el intento. Si quedan reintentos, vuelve a la cola
+         con una hora futura; si se agotaron, se cierra sin contacto. */
+      if (tipo === 'no_contesta') {
+        const intentos = c.intentos + 1;
+        const quedan = intentos <= c.reintentos;
+
+        await bd.consultar(
+          `UPDATE base_contacto
+              SET estado = ?, intentos = ?, ultimo_intento = NOW(),
+                  proximo_intento = ?, resultado = ?, observaciones = ?,
+                  agente_id = NULL, asignado_en = NULL
+            WHERE id = ?`,
+          [quedan ? 'pendiente' : 'sin_contacto', intentos,
+           quedan ? new Date(Date.now() + c.intervalo_min * 60000) : null,
+           resultado || 'No contesta', observaciones, id]);
+
+        return res.json({
+          ok: true,
+          estado: quedan ? 'pendiente' : 'sin_contacto',
+          intentos,
+          /* Si hay segundo teléfono, el próximo intento irá a ese */
+          proximoTelefono: quedan && c.telefono_2 ? c.telefono_2 : null,
+        });
+      }
+
+      /* ── Excluir: número equivocado o pidió no ser llamado ── */
+      if (tipo === 'excluir') {
+        await bd.transaccion(async (cx) => {
+          await cx.execute(
+            `UPDATE base_contacto SET estado = 'excluido', resultado = ?, observaciones = ?,
+                    agente_id = NULL, asignado_en = NULL WHERE id = ?`,
+            [resultado || 'Excluido', observaciones, id]);
+
+          /* Si pidió no ser llamado, queda en la lista general */
+          if (req.body.no_llamar) {
+            await cx.execute(
+              'INSERT IGNORE INTO no_llamar (numero, motivo) VALUES (?, ?)',
+              [c.telefono_1, (observaciones || 'Lo pidió el cliente').slice(0, 160)]);
+          }
+        });
+        return res.json({ ok: true, estado: 'excluido' });
+      }
+
+      res.status(400).json({ error: 'Tipo de resultado no válido' });
+    } catch (e) { next(e); }
+  });
+
+/* ═══════════ SEGUIMIENTO ═══════════ */
+
+router.get('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const b = await bd.una('SELECT campana_id FROM base WHERE id = ?', [id]);
+      if (!b) return res.status(404).json({ error: 'Esa base no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const cond = ['c.base_id = ?'];
+      const val = [id];
+      if (req.query.estado) { cond.push('c.estado = ?'); val.push(req.query.estado); }
+
+      const contactos = await bd.consultar(
+        `SELECT c.id, c.telefono_1, c.telefono_2, c.nombre, c.documento, c.estado,
+                c.intentos, c.ultimo_intento, c.proximo_intento, c.agendado_para,
+                c.resultado, c.observaciones, u.nombre AS agente
+           FROM base_contacto c LEFT JOIN usuario u ON u.id = c.agente_id
+          WHERE ${cond.join(' AND ')}
+          ORDER BY c.id LIMIT 2000`, val);
+
+      const resumen = await bd.una(
+        `SELECT COUNT(*) AS total,
+                SUM(estado = 'pendiente')    AS pendientes,
+                SUM(estado = 'asignado')     AS en_gestion,
+                SUM(estado = 'gestionado')   AS gestionados,
+                SUM(estado = 'sin_contacto') AS sin_contacto,
+                SUM(estado = 'agendado')     AS agendados,
+                SUM(estado = 'excluido')     AS excluidos
+           FROM base_contacto WHERE base_id = ?`, [id]);
+
+      res.json({ resumen, contactos });
+    } catch (e) { next(e); }
+  });
+
+module.exports = router;
