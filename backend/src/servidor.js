@@ -15,6 +15,7 @@
 const express = require('express');
 const cors = require('cors');
 const CONFIG = require('./config');
+const ami = require('./ami');
 const bd = require('./bd');
 
 const app = express();
@@ -106,6 +107,18 @@ async function arrancar() {
 
   console.log(`  Central          ${CONFIG.pbx.wss || '(sin configurar)'}`);
   console.log(`  Realtime         ${CONFIG.realtime ? 'activo' : 'desactivado'}`);
+
+  /* Canal de control con Asterisk. Se conecta solo y se reconecta si
+       se cae; los avisos salen por consola para que queden en PM2. */
+    if (ami.habilitado) {
+      ami.on('listo', () => console.log('  Asterisk (AMI)   conectado'));
+      ami.on('desconectado', (motivo) =>
+        console.log(`  Asterisk (AMI)   desconectado${motivo ? ': ' + motivo : ''}`));
+      ami.conectar();
+      console.log('  Asterisk (AMI)   conectando…');
+    } else {
+      console.log('  Asterisk (AMI)   desactivado');
+    }
 
   app.listen(CONFIG.puerto, () => {
     console.log(`  Escuchando en    http://localhost:${CONFIG.puerto}`);

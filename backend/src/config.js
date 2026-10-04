@@ -85,6 +85,18 @@ const CONFIG = {
     claveEntrega: process.env.SMS_CLAVE_ENTREGA || '',
   },
 
+/* ── Canal con Asterisk ──
+     Conexión permanente para originar llamadas y recibir eventos. Es
+     la llave completa de la central: debe escuchar solo en 127.0.0.1
+     y con una clave larga. */
+  ami: {
+    activo:  process.env.AMI_ACTIVO === 'true',
+    host:    process.env.AMI_HOST || '127.0.0.1',
+    puerto:  Number(process.env.AMI_PUERTO) || 5038,
+    usuario: process.env.AMI_USUARIO || '',
+    clave:   process.env.AMI_CLAVE || '',
+  },
+
   realtime: process.env.REALTIME === 'true',
 };
 

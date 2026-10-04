@@ -28,6 +28,7 @@
 const express = require('express');
 const bd = require('../bd');
 const auth = require('../auth');
+const ami = require('../ami');
 
 const router = express.Router();
 
@@ -588,6 +589,45 @@ router.get('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
 
       res.json({ resumen, contactos });
     } catch (e) { next(e); }
+  });
+
+/* ═══════════ CANAL CON ASTERISK ═══════════
+
+   Permite ver desde la plataforma si la conexión con la central está
+   viva. Si se cae, la marcación automática se detiene, así que el
+   administrador necesita enterarse sin entrar al servidor. */
+
+router.get('/ami/estado', auth.exigirSesion, auth.exigir('marcacion'),
+  (req, res) => res.json(ami.estado()));
+
+/** Llamada de prueba: marca un número y lo conecta con una extensión.
+    Sirve para comprobar que el canal funciona antes de lanzar una base
+    completa. Solo administradores. */
+router.post('/ami/probar', auth.exigirSesion, auth.exigir('usuarios'),
+  async (req, res, next) => {
+    try {
+      const numero = String(req.body.numero || '').replace(/\D/g, '');
+      const extension = String(req.body.extension || '').replace(/\D/g, '');
+
+      if (!numero || !extension) {
+        return res.status(400).json({ error: 'Hacen falta el número y la extensión' });
+      }
+      if (!ami.estado().conectado) {
+        return res.status(503).json({
+          error: 'No hay conexión con la central',
+          detalle: ami.estado().ultimoError,
+        });
+      }
+
+      await ami.originar({ numero, extension, identificador: 'prueba' });
+
+      await auth.auditar(req.usuario.id, 'crear', 'llamada', null,
+        `Llamada de prueba a ${numero} desde la extensión ${extension}`, req.ip);
+
+      res.json({ ok: true, aviso: 'La llamada se está originando. Revisa el teléfono.' });
+    } catch (e) {
+      res.status(502).json({ error: e.message });
+    }
   });
 
 module.exports = router;
