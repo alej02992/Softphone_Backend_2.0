@@ -30,6 +30,7 @@ const bd = require('../bd');
 const auth = require('../auth');
 const ami = require('../ami');
 const motor = require('../motor');
+const CONFIG = require('../config');
 
 const router = express.Router();
 
@@ -703,5 +704,85 @@ router.post('/ami/probar', auth.exigirSesion, auth.exigir('usuarios'),
       res.status(502).json({ error: e.message });
     }
   });
+
+/* ═══════════ ESCUCHA EN VIVO ═══════════
+
+   El supervisor entra a oír una llamada en curso. Asterisk lo hace con
+   ChanSpy, y la plataforma solo tiene que conectar la extensión del
+   supervisor con esa función.
+
+   TRES MODOS
+   escuchar   solo oye; ni el agente ni el cliente lo notan
+   susurrar   le habla al agente sin que el cliente lo oiga
+   entrar     los tres hablan
+
+   DOS REGLAS QUE NO SE NEGOCIAN
+   Un supervisor solo puede escuchar a los agentes de sus campañas, y
+   cada escucha queda registrada: quién oyó a quién y cuándo. Escuchar
+   conversaciones ajenas es delicado, y si alguien pregunta, tiene que
+   haber respuesta.                                                     */
+
+const MODOS = {
+  escuchar: { opciones: 'q',   texto: 'escuchó' },
+  susurrar: { opciones: 'qw',  texto: 'susurró a' },
+  entrar:   { opciones: 'qB',  texto: 'entró a la llamada de' },
+};
+
+router.post('/escucha', auth.exigirSesion, auth.exigir('escucha'), async (req, res, next) => {
+  try {
+    const modo = MODOS[req.body.modo] ? req.body.modo : 'escuchar';
+    const objetivo = String(req.body.extension || '').replace(/\D/g, '');
+    if (!objetivo) return res.status(400).json({ error: 'Falta la extensión del agente' });
+
+    /* El supervisor necesita su propia extensión para que la central lo
+       llame y lo meta en la escucha. */
+    const yo = await bd.una('SELECT extension FROM usuario WHERE id = ?', [req.usuario.id]);
+    if (!yo?.extension) {
+      return res.status(400).json({
+        error: 'No tienes extensión asignada: pídesela al administrador para poder escuchar' });
+    }
+    if (yo.extension === objetivo) {
+      return res.status(400).json({ error: 'No puedes escucharte a ti mismo' });
+    }
+
+    /* Solo agentes de sus campañas */
+    const agente = await bd.una(
+      `SELECT u.id, u.nombre, u.campana_id FROM usuario u
+        WHERE u.extension = ? AND u.activo = TRUE`, [objetivo]);
+    if (!agente) return res.status(404).json({ error: 'Esa extensión no es de ningún agente activo' });
+
+    const no = await puedeCon(req.usuario, agente.campana_id);
+    if (no) return res.status(403).json({ error: 'Ese agente no está en tus campañas' });
+
+    if (!ami.estado().conectado) {
+      return res.status(503).json({ error: 'No hay conexión con la central' });
+    }
+
+    /* La central llama al supervisor y, al contestar, lo conecta con la
+       escucha del agente. El contexto lo define el plan de marcación. */
+    await ami.enviar({
+      Action: 'Originate',
+      Channel: `PJSIP/${yo.extension}`,
+      Context: CONFIG.escucha?.contexto || 'bpm-escucha',
+      Exten: objetivo,
+      Priority: 1,
+      Timeout: 20000,
+      CallerID: `Escucha ${objetivo} <${objetivo}>`,
+      Async: 'true',
+      Variable: `BPM_MODO=${MODOS[modo].opciones}`,
+    });
+
+    await auth.auditar(req.usuario.id, 'consultar', 'escucha', agente.id,
+      `${MODOS[modo].texto} ${agente.nombre} (extensión ${objetivo})`, req.ip);
+
+    res.json({
+      ok: true,
+      modo,
+      aviso: 'Contesta tu extensión para entrar a la llamada.',
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
 
 module.exports = router;

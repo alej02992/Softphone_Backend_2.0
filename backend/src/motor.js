@@ -178,8 +178,20 @@ async function vuelta() {
     await soltarAtascadas();
     await cerrarVencidas();
 
+    /* Quién está hablando ahora mismo, según la central. Si un agente
+       marcó por su cuenta, no se le manda una llamada automática
+       encima. Se pregunta una vez por vuelta, no por agente. */
+    let ocupadas = new Set();
+    try { ocupadas = await ami.extensionesEnLlamada(); }
+    catch { /* si falla la consulta, se sigue con lo que se sabe */ }
+
     for (const base of await basesActivas()) {
-      const libres = await agentesLibres(base.campana_id);
+      const todos = await agentesLibres(base.campana_id);
+      const libres = todos.filter((a) => !ocupadas.has(String(a.extension)));
+
+      if (todos.length && !libres.length) {
+        anotar('Todos los agentes libres están en una llamada propia');
+      }
       if (!libres.length) continue;
 
       /* Con simultaneas en 1 se marca una llamada por agente libre.

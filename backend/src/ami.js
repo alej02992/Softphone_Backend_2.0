@@ -262,6 +262,67 @@ class Ami extends EventEmitter {
     });
   }
 
+  /**
+   * Acciones que responden con una lista. Asterisk contesta primero
+   * "Success" y después va mandando un evento por cada elemento, hasta
+   * uno final que avisa que terminó. Hay que juntarlos todos.
+   *
+   * Se usa para preguntar qué llamadas hay en curso.
+   */
+  listar(accion, eventoElemento, eventoFinal) {
+    return new Promise((listo, fallar) => {
+      if (!this.socket || !this.conectado) {
+        return fallar(new Error('No hay conexión con Asterisk'));
+      }
+
+      const id = `bpm-${Date.now()}-${++this.contador}`;
+      const elementos = [];
+
+      const recoger = (m) => {
+        if (m.ActionID !== id) return;
+        if (m.Event === eventoElemento) elementos.push(m);
+        if (m.Event === eventoFinal) {
+          clearTimeout(temporizador);
+          this.off('evento', recoger);
+          this.pendientes.delete(id);
+          listo(elementos);
+        }
+      };
+
+      const temporizador = setTimeout(() => {
+        this.off('evento', recoger);
+        this.pendientes.delete(id);
+        /* Si no llegó el final, se devuelve lo que se alcanzó a juntar:
+           una lista incompleta es mejor que un error. */
+        listo(elementos);
+      }, ESPERA_RESPUESTA_MS);
+
+      this.on('evento', recoger);
+      /* La respuesta inicial no interesa; los datos vienen en eventos */
+      this.pendientes.set(id, { listo: () => {}, fallar: () => {}, temporizador: setTimeout(() => {}, 0) });
+
+      this.socket.write(
+        Object.entries({ ...accion, ActionID: id })
+          .map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
+    });
+  }
+
+  /** Extensiones que están ahora mismo en una llamada.
+      Se le pregunta a la central, no al navegador: así da igual si el
+      agente marcó desde la plataforma o desde otro teléfono. */
+  async extensionesEnLlamada() {
+    const canales = await this.listar(
+      { Action: 'CoreShowChannels' }, 'CoreShowChannel', 'CoreShowChannelsComplete');
+
+    const ocupadas = new Set();
+    canales.forEach((c) => {
+      /* Los canales se llaman PJSIP/1011-00000042 */
+      const m = /^PJSIP\/(\w+)-/.exec(c.Channel || '');
+      if (m) ocupadas.add(m[1]);
+    });
+    return ocupadas;
+  }
+
   /** Cuelga un canal. */
   colgar(canal) {
     return this.enviar({ Action: 'Hangup', Channel: canal });
