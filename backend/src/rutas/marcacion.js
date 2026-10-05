@@ -722,20 +722,31 @@ router.post('/ami/probar', auth.exigirSesion, auth.exigir('usuarios'),
    conversaciones ajenas es delicado, y si alguien pregunta, tiene que
    haber respuesta.                                                     */
 
+/* Cada modo tiene su propio código interno. Así no hace falta mandar
+   variables por el canal: el número ya dice qué hacer.
+
+   El supervisor nunca ve ni escribe estos códigos: los marca la
+   plataforma por detrás cuando él pulsa el botón. */
 const MODOS = {
-  escuchar: { opciones: 'q',   texto: 'escuchó' },
-  susurrar: { opciones: 'qw',  texto: 'susurró a' },
-  entrar:   { opciones: 'qB',  texto: 'entró a la llamada de' },
+  escuchar: { codigo: '*55', texto: 'escuchó a' },
+  susurrar: { codigo: '*56', texto: 'susurró a' },
+  entrar:   { codigo: '*57', texto: 'entró a la llamada de' },
 };
 
+/**
+ * Autoriza una escucha y devuelve el código que la plataforma marcará.
+ *
+ * No se origina la llamada desde aquí a propósito. Si la central
+ * llamara al supervisor, él tendría que contestar su teléfono para
+ * poder oír. Marcando desde su navegador, la escucha empieza al
+ * instante: pulsa el botón y ya está oyendo.
+ */
 router.post('/escucha', auth.exigirSesion, auth.exigir('escucha'), async (req, res, next) => {
   try {
     const modo = MODOS[req.body.modo] ? req.body.modo : 'escuchar';
     const objetivo = String(req.body.extension || '').replace(/\D/g, '');
     if (!objetivo) return res.status(400).json({ error: 'Falta la extensión del agente' });
 
-    /* El supervisor necesita su propia extensión para que la central lo
-       llame y lo meta en la escucha. */
     const yo = await bd.una('SELECT extension FROM usuario WHERE id = ?', [req.usuario.id]);
     if (!yo?.extension) {
       return res.status(400).json({
@@ -745,7 +756,8 @@ router.post('/escucha', auth.exigirSesion, auth.exigir('escucha'), async (req, r
       return res.status(400).json({ error: 'No puedes escucharte a ti mismo' });
     }
 
-    /* Solo agentes de sus campañas */
+    /* Solo agentes de sus campañas. Esto se comprueba aquí y no en la
+       pantalla: ocultar un botón no protege nada. */
     const agente = await bd.una(
       `SELECT u.id, u.nombre, u.campana_id FROM usuario u
         WHERE u.extension = ? AND u.activo = TRUE`, [objetivo]);
@@ -754,35 +766,18 @@ router.post('/escucha', auth.exigirSesion, auth.exigir('escucha'), async (req, r
     const no = await puedeCon(req.usuario, agente.campana_id);
     if (no) return res.status(403).json({ error: 'Ese agente no está en tus campañas' });
 
-    if (!ami.estado().conectado) {
-      return res.status(503).json({ error: 'No hay conexión con la central' });
-    }
-
-    /* La central llama al supervisor y, al contestar, lo conecta con la
-       escucha del agente. El contexto lo define el plan de marcación. */
-    await ami.enviar({
-      Action: 'Originate',
-      Channel: `PJSIP/${yo.extension}`,
-      Context: CONFIG.escucha?.contexto || 'bpm-escucha',
-      Exten: objetivo,
-      Priority: 1,
-      Timeout: 20000,
-      CallerID: `Escucha ${objetivo} <${objetivo}>`,
-      Async: 'true',
-      Variable: `BPM_MODO=${MODOS[modo].opciones}`,
-    });
-
+    /* Queda registrado antes de empezar: si alguien pregunta quién oyó
+       una llamada, tiene que haber respuesta. */
     await auth.auditar(req.usuario.id, 'consultar', 'escucha', agente.id,
       `${MODOS[modo].texto} ${agente.nombre} (extensión ${objetivo})`, req.ip);
 
     res.json({
       ok: true,
       modo,
-      aviso: 'Contesta tu extensión para entrar a la llamada.',
+      agente: agente.nombre,
+      numero: MODOS[modo].codigo + objetivo,
     });
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
+  } catch (e) { next(e); }
 });
 
 module.exports = router;
