@@ -29,6 +29,7 @@ const express = require('express');
 const bd = require('../bd');
 const auth = require('../auth');
 const ami = require('../ami');
+const motor = require('../motor');
 
 const router = express.Router();
 
@@ -99,6 +100,15 @@ router.get('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req
   } catch (e) { next(e); }
 });
 
+/* Cuántas llamadas por agente libre. 1 es progresiva: nunca hay un
+   cliente esperando. Por encima de 1 es predictiva, y conviene dejar
+   un tope para que nadie escriba un número que sature la troncal. */
+function simultaneasDe(b) {
+  const n = Number(b.simultaneas);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, 2);
+}
+
 function revisarBase(b) {
   if (!b.nombre || String(b.nombre).trim().length < 3) {
     return 'La base necesita un nombre de al menos tres caracteres';
@@ -126,11 +136,11 @@ router.post('/bases', auth.exigirSesion, auth.exigir('marcacion'), async (req, r
 
     const [r] = await bd.pool.execute(
       `INSERT INTO base (nombre, campana_id, reintentos, intervalo_min,
-                         hora_inicio, hora_fin, dias, creado_por)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                         hora_inicio, hora_fin, dias, marcacion_auto, simultaneas, creado_por)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.reintentos ?? 2, b.intervalo_min ?? 60,
        b.hora_inicio || '08:00:00', b.hora_fin || '19:00:00',
-       b.dias || 'L,M,X,J,V', req.usuario.id]);
+       b.dias || 'L,M,X,J,V', !!b.marcacion_auto, simultaneasDe(b), req.usuario.id]);
 
     await auth.auditar(req.usuario.id, 'crear', 'base', r.insertId,
       `Creó la base ${b.nombre}`, req.ip);
@@ -142,21 +152,40 @@ router.post('/bases', auth.exigirSesion, auth.exigir('marcacion'), async (req, r
 router.put('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const actual = await bd.una('SELECT campana_id FROM base WHERE id = ?', [id]);
+    const actual = await bd.una('SELECT * FROM base WHERE id = ?', [id]);
     if (!actual) return res.status(404).json({ error: 'Esa base no existe' });
 
     const no = await puedeCon(req.usuario, actual.campana_id);
     if (no) return res.status(403).json({ error: no });
 
-    const b = req.body || {};
-    const error = revisarBase({ ...b, campana_id: b.campana_id || actual.campana_id });
+    /* Lo que no llega se conserva. Antes se reemplazaba por el valor
+       por defecto, así que una petición con un solo campo apagaba la
+       marcación automática o cambiaba los horarios sin que nadie lo
+       pidiera. */
+    const b = { ...req.body };
+    const tomar = (clave, porDefecto) =>
+      (b[clave] === undefined || b[clave] === null || b[clave] === '' ? porDefecto : b[clave]);
+
+    const datos = {
+      nombre: String(tomar('nombre', actual.nombre)).trim(),
+      reintentos: tomar('reintentos', actual.reintentos),
+      intervalo_min: tomar('intervalo_min', actual.intervalo_min),
+      hora_inicio: tomar('hora_inicio', actual.hora_inicio),
+      hora_fin: tomar('hora_fin', actual.hora_fin),
+      dias: tomar('dias', actual.dias),
+      marcacion_auto: b.marcacion_auto === undefined ? !!actual.marcacion_auto : !!b.marcacion_auto,
+      simultaneas: b.simultaneas === undefined ? actual.simultaneas : simultaneasDe(b),
+    };
+
+    const error = revisarBase({ ...datos, campana_id: actual.campana_id });
     if (error) return res.status(400).json({ error });
 
     await bd.consultar(
       `UPDATE base SET nombre = ?, reintentos = ?, intervalo_min = ?,
-              hora_inicio = ?, hora_fin = ?, dias = ? WHERE id = ?`,
-      [String(b.nombre).trim(), b.reintentos ?? 2, b.intervalo_min ?? 60,
-       b.hora_inicio || '08:00:00', b.hora_fin || '19:00:00', b.dias || 'L,M,X,J,V', id]);
+              hora_inicio = ?, hora_fin = ?, dias = ?, marcacion_auto = ?, simultaneas = ?
+        WHERE id = ?`,
+      [datos.nombre, datos.reintentos, datos.intervalo_min, datos.hora_inicio,
+       datos.hora_fin, datos.dias, datos.marcacion_auto, datos.simultaneas, id]);
 
     res.json({ ok: true });
   } catch (e) { next(e); }
@@ -184,6 +213,24 @@ router.put('/bases/:id/estado', auth.exigirSesion, auth.exigir('marcacion'),
         if (!n.n) {
           return res.status(400).json({ error: 'La base no tiene contactos pendientes por llamar' });
         }
+
+        /* Con marcación automática y el canal caído, la base quedaría
+           activa sin marcar a nadie. Mejor decirlo ahora. */
+        const auto = await bd.una('SELECT marcacion_auto FROM base WHERE id = ?', [id]);
+        if (auto.marcacion_auto && !ami.estado().conectado) {
+          return res.status(503).json({
+            error: 'No hay conexión con la central: la marcación automática no podría llamar. ' +
+                   'Revisa el estado del canal antes de activar la base.',
+          });
+        }
+      }
+
+      /* Al pausar, las llamadas en curso vuelven a la cola */
+      if (destino !== 'activa') {
+        await bd.consultar(
+          `UPDATE base_contacto SET estado = 'pendiente', agente_id = NULL,
+                  asignado_en = NULL, canal = NULL
+            WHERE base_id = ? AND estado = 'llamando'`, [id]);
       }
 
       /* Al pausar, lo que estaba asignado vuelve a la cola: nadie se
@@ -599,6 +646,12 @@ router.get('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
 
 router.get('/ami/estado', auth.exigirSesion, auth.exigir('marcacion'),
   (req, res) => res.json(ami.estado()));
+
+/** Qué está haciendo el motor: si anda, cómo está el canal y las
+    últimas decisiones que tomó. Sirve para entender por qué una base
+    no está marcando sin entrar al servidor. */
+router.get('/marcacion/motor', auth.exigirSesion, auth.exigir('marcacion'),
+  (req, res) => res.json(motor.estado()));
 
 /** Llamada de prueba: marca un número y lo conecta con una extensión.
     Sirve para comprobar que el canal funciona antes de lanzar una base
