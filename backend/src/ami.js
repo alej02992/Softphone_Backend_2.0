@@ -223,7 +223,12 @@ class Ami extends EventEmitter {
         fallar(new Error('Asterisk no respondió a tiempo'));
       }, ESPERA_RESPUESTA_MS);
 
-      this.pendientes.set(id, { listo, fallar, temporizador });
+      /* La respuesta lleva el mismo identificador con el que salió la
+         acción. Se devuelve para poder cruzar después los eventos que
+         Asterisk manda sobre esa misma llamada. */
+      this.pendientes.set(id, {
+        listo: (m) => listo({ ...m, __id: id }), fallar, temporizador,
+      });
 
       const texto = Object.entries({ ...accion, ActionID: id })
         .map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n';

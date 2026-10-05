@@ -45,6 +45,13 @@ const FALLOS_PARA_PAUSA = 2;
 let reloj = null;
 let trabajando = false;
 const fallosPorAgente = new Map();
+
+/* Qué contacto corresponde a cada llamada ordenada.
+   Asterisk avisa el resultado con el mismo identificador con el que se
+   le pidió marcar, pero NO devuelve las variables que se le mandaron.
+   Por eso la correspondencia se guarda aquí, y además se deja el número
+   como respaldo por si llega un aviso sin identificador. */
+const llamadasEnCurso = new Map();
 const historial = [];          // últimas decisiones, para diagnóstico
 
 function anotar(texto) {
@@ -109,9 +116,16 @@ async function tomarContacto(baseId, agenteId) {
         AND estado IN ('pendiente', 'agendado')
         AND (proximo_intento IS NULL OR proximo_intento <= NOW())
         AND (agendado_para IS NULL OR agendado_para <= NOW())
+        /* Nunca se vuelve a marcar a un número que ya se gestionó en
+           esta base, aunque aparezca repetido en el archivo. */
+        AND telefono_1 NOT IN (
+          SELECT telefono_1 FROM (
+            SELECT telefono_1 FROM base_contacto
+             WHERE base_id = ? AND estado IN ('gestionado','excluido')
+          ) AS ya)
       ORDER BY (agendado_para IS NOT NULL) DESC, agendado_para ASC, id ASC
       LIMIT 1`,
-    [agenteId, baseId]);
+    [agenteId, baseId, baseId]);
 
   if (!r.affectedRows) return null;
 
@@ -126,16 +140,29 @@ async function tomarContacto(baseId, agenteId) {
     resultado. Vuelven a la cola sin gastar intento. */
 async function soltarAtascadas() {
   const atascadas = await bd.consultar(
-    `SELECT id, agente_id FROM base_contacto
-      WHERE estado = 'llamando'
-        AND llamado_en < DATE_SUB(NOW(), INTERVAL ? MINUTE)`, [MINUTOS_ATASCO]);
+    `SELECT c.id, c.agente_id, c.intentos, b.reintentos, b.intervalo_min
+       FROM base_contacto c JOIN base b ON b.id = c.base_id
+      WHERE c.estado = 'llamando'
+        AND c.llamado_en < DATE_SUB(NOW(), INTERVAL ? MINUTE)`, [MINUTOS_ATASCO]);
 
   for (const c of atascadas) {
+    /* Cuenta como intento. Si no se contara, una llamada cuyo resultado
+       nunca llega se repetiría sin límite a la misma persona: es lo que
+       pasaba antes de cruzar bien los avisos de la central. */
+    const intentos = (c.intentos || 0) + 1;
+    const quedan = intentos <= (c.reintentos ?? 2);
+
     await bd.consultar(
       `UPDATE base_contacto
-          SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL, canal = NULL
-        WHERE id = ?`, [c.id]);
-    anotar(`Contacto ${c.id} llevaba demasiado tiempo llamando: vuelve a la cola`);
+          SET estado = ?, intentos = ?, ultimo_intento = NOW(), proximo_intento = ?,
+              resultado = COALESCE(resultado, 'Sin respuesta de la central'),
+              agente_id = NULL, asignado_en = NULL, canal = NULL
+        WHERE id = ?`,
+      [quedan ? 'pendiente' : 'sin_contacto', intentos,
+       quedan ? new Date(Date.now() + (c.intervalo_min || 60) * 60000) : null, c.id]);
+
+    anotar(`Contacto ${c.id} sin respuesta de la central. Intento ${intentos}` +
+           (quedan ? '' : ': se cierra sin contacto'));
   }
 }
 
@@ -209,13 +236,20 @@ async function vuelta() {
           ? contacto.telefono_2 : contacto.telefono_1;
 
         try {
-          await ami.originar({
+          const orden = await ami.originar({
             numero,
             extension: agente.extension,
             identificador: String(contacto.id),
             espera: ESPERA_TIMBRE,
             datos: { BPM_AGENTE: agente.id, BPM_BASE: base.id },
           });
+          /* Se apunta a qué contacto pertenece esta llamada */
+          if (orden?.__id) {
+            llamadasEnCurso.set(orden.__id, { contacto: contacto.id, numero });
+            /* No se guarda para siempre: si el aviso nunca llega, esta
+               entrada se limpia sola. */
+            setTimeout(() => llamadasEnCurso.delete(orden.__id), 5 * 60000);
+          }
           anotar(`Marcando ${numero} para ${agente.nombre}`);
         } catch (e) {
           /* No se pudo ni ordenar la llamada: el contacto vuelve a la
@@ -242,8 +276,28 @@ async function vuelta() {
  * saber si contestaron sin que el agente tenga que decirlo.
  */
 async function alResponder(evento) {
-  /* El identificador del contacto viaja en la llamada y vuelve aquí */
-  const id = Number(evento.BPM_ID || evento.Variable?.BPM_ID);
+  /* Cómo se sabe de qué contacto habla este aviso.
+
+     Asterisk responde con el mismo identificador con el que se le pidió
+     marcar, así que esa es la vía principal. Si por alguna razón no
+     llega, se busca por el número marcado entre las llamadas en curso:
+     vale más resolverlo por el número que perder el resultado y acabar
+     llamando dos veces a la misma persona. */
+  let id = null;
+
+  const apuntado = llamadasEnCurso.get(evento.ActionID);
+  if (apuntado) {
+    id = apuntado.contacto;
+    llamadasEnCurso.delete(evento.ActionID);
+  } else if (evento.Exten) {
+    const porNumero = await bd.una(
+      `SELECT id FROM base_contacto
+        WHERE estado = 'llamando'
+          AND (telefono_1 = ? OR telefono_2 = ?)
+        ORDER BY llamado_en DESC LIMIT 1`, [evento.Exten, evento.Exten]);
+    if (porNumero) id = porNumero.id;
+  }
+
   if (!id) return;
 
   const c = await bd.una(
