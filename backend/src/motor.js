@@ -84,8 +84,17 @@ async function agentesLibres(campanaId) {
         AND u.extension IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM pausa p
                          WHERE p.usuario_id = u.id AND p.fin IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM base_contacto c
-                         WHERE c.agente_id = u.id AND c.estado IN ('asignado','llamando'))
+        /* Ocupado mientras tenga una llamada en curso, o mientras le
+           dure el tiempo de cierre después de colgar. Al vencer ese
+           tiempo vuelve a contar como libre aunque no haya tipificado:
+           así la operación no se detiene esperando a una persona. */
+        AND NOT EXISTS (
+          SELECT 1 FROM base_contacto c JOIN base b2 ON b2.id = c.base_id
+           WHERE c.agente_id = u.id
+             AND (c.estado = 'llamando'
+               OR (c.estado = 'asignado'
+                   AND (c.colgado_en IS NULL
+                        OR c.colgado_en > DATE_SUB(NOW(), INTERVAL b2.cierre_seg SECOND)))))
       GROUP BY u.id`, [campanaId]);
 }
 
@@ -132,6 +141,34 @@ async function soltarAtascadas() {
 
 /* ═══════════ EL CICLO ═══════════ */
 
+/**
+ * Cierra las gestiones cuya ventana de tipificación ya venció.
+ *
+ * Si el agente colgó y no escribió el resultado dentro del tiempo de
+ * cierre, la gestión se guarda igual marcada como sin tipificar. Si no
+ * se hiciera, un agente distraído dejaría contactos bloqueados y la
+ * base se iría frenando sola.
+ */
+async function cerrarVencidas() {
+  const vencidas = await bd.consultar(
+    `SELECT c.id, c.agente_id
+       FROM base_contacto c JOIN base b ON b.id = c.base_id
+      WHERE c.estado = 'asignado'
+        AND b.marcacion_auto = TRUE
+        AND c.colgado_en IS NOT NULL
+        AND c.colgado_en <= DATE_SUB(NOW(), INTERVAL b.cierre_seg SECOND)`);
+
+  for (const c of vencidas) {
+    await bd.consultar(
+      `UPDATE base_contacto
+          SET estado = 'gestionado', gestionado_en = NOW(),
+              resultado = COALESCE(resultado, 'Sin tipificar'),
+              intentos = intentos + 1, ultimo_intento = NOW()
+        WHERE id = ? AND estado = 'asignado'`, [c.id]);
+    anotar(`Contacto ${c.id}: se cerró solo al vencer el tiempo de cierre`);
+  }
+}
+
 async function vuelta() {
   if (trabajando) return;            // no se solapan dos vueltas
   if (!ami.estado().conectado) return;
@@ -139,6 +176,7 @@ async function vuelta() {
   trabajando = true;
   try {
     await soltarAtascadas();
+    await cerrarVencidas();
 
     for (const base of await basesActivas()) {
       const libres = await agentesLibres(base.campana_id);
@@ -259,6 +297,20 @@ async function alResponder(evento) {
   anotar(`Contacto ${id}: no contestó. Intento ${intentos} de ${c.reintentos + 1}`);
 }
 
+/**
+ * Asterisk avisa cuando se cuelga un canal. Si era el de una gestión en
+ * curso, aquí empieza a contar el tiempo que tiene el agente para
+ * escribir el resultado antes de que entre la siguiente llamada.
+ */
+async function alColgar(evento) {
+  const [r] = await bd.pool.execute(
+    `UPDATE base_contacto SET colgado_en = NOW()
+      WHERE canal = ? AND estado = 'asignado' AND colgado_en IS NULL`,
+    [evento.Channel]);
+
+  if (r.affectedRows) anotar(`Llamada terminada en ${evento.Channel}: empieza el cierre`);
+}
+
 /** Pone al agente en pausa porque no está atendiendo las llamadas. */
 async function pausarAgente(usuarioId) {
   try {
@@ -287,6 +339,8 @@ function arrancar() {
      cuando termina el intento de llamada. */
   ami.on('evento', (e) => {
     if (e.Event === 'OriginateResponse') alResponder(e).catch(() => {});
+    /* Al colgar empieza a correr el tiempo de cierre del agente */
+    if (e.Event === 'Hangup' && e.Channel) alColgar(e).catch(() => {});
   });
 
   reloj = setInterval(() => { vuelta().catch(() => {}); }, CICLO_MS);

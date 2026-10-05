@@ -109,6 +109,14 @@ function simultaneasDe(b) {
   return Math.min(n, 2);
 }
 
+/* Segundos de cierre: de 0 a 5 minutos. Con 0, la siguiente llamada
+   entra apenas el agente cuelga. */
+function cierreDe(valor, porDefecto) {
+  const n = Number(valor);
+  if (!Number.isFinite(n) || n < 0) return porDefecto;
+  return Math.min(Math.round(n), 300);
+}
+
 function revisarBase(b) {
   if (!b.nombre || String(b.nombre).trim().length < 3) {
     return 'La base necesita un nombre de al menos tres caracteres';
@@ -136,11 +144,13 @@ router.post('/bases', auth.exigirSesion, auth.exigir('marcacion'), async (req, r
 
     const [r] = await bd.pool.execute(
       `INSERT INTO base (nombre, campana_id, reintentos, intervalo_min,
-                         hora_inicio, hora_fin, dias, marcacion_auto, simultaneas, creado_por)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                         hora_inicio, hora_fin, dias, marcacion_auto, simultaneas,
+                         cierre_seg, creado_por)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.reintentos ?? 2, b.intervalo_min ?? 60,
        b.hora_inicio || '08:00:00', b.hora_fin || '19:00:00',
-       b.dias || 'L,M,X,J,V', !!b.marcacion_auto, simultaneasDe(b), req.usuario.id]);
+       b.dias || 'L,M,X,J,V', !!b.marcacion_auto, simultaneasDe(b),
+       cierreDe(b.cierre_seg, 30), req.usuario.id]);
 
     await auth.auditar(req.usuario.id, 'crear', 'base', r.insertId,
       `Creó la base ${b.nombre}`, req.ip);
@@ -175,6 +185,7 @@ router.put('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req
       dias: tomar('dias', actual.dias),
       marcacion_auto: b.marcacion_auto === undefined ? !!actual.marcacion_auto : !!b.marcacion_auto,
       simultaneas: b.simultaneas === undefined ? actual.simultaneas : simultaneasDe(b),
+      cierre_seg: b.cierre_seg === undefined ? actual.cierre_seg : cierreDe(b.cierre_seg, actual.cierre_seg),
     };
 
     const error = revisarBase({ ...datos, campana_id: actual.campana_id });
@@ -182,10 +193,12 @@ router.put('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req
 
     await bd.consultar(
       `UPDATE base SET nombre = ?, reintentos = ?, intervalo_min = ?,
-              hora_inicio = ?, hora_fin = ?, dias = ?, marcacion_auto = ?, simultaneas = ?
+              hora_inicio = ?, hora_fin = ?, dias = ?, marcacion_auto = ?, simultaneas = ?,
+              cierre_seg = ?
         WHERE id = ?`,
       [datos.nombre, datos.reintentos, datos.intervalo_min, datos.hora_inicio,
-       datos.hora_fin, datos.dias, datos.marcacion_auto, datos.simultaneas, id]);
+       datos.hora_fin, datos.dias, datos.marcacion_auto, datos.simultaneas,
+       datos.cierre_seg, id]);
 
     res.json({ ok: true });
   } catch (e) { next(e); }
@@ -398,7 +411,8 @@ router.get('/marcacion/siguiente', auth.exigirSesion, async (req, res, next) => 
 
     /* La base activa de su campaña. Si hay varias, la más antigua. */
     const base = await bd.una(
-      `SELECT id, reintentos, intervalo_min, hora_inicio, hora_fin, dias
+      `SELECT id, reintentos, intervalo_min, hora_inicio, hora_fin, dias,
+              marcacion_auto, cierre_seg
          FROM base WHERE campana_id = ? AND estado = 'activa'
         ORDER BY creado LIMIT 1`, [yo.campana_id]);
 
@@ -481,7 +495,14 @@ router.get('/marcacion/siguiente', auth.exigirSesion, async (req, res, next) => 
 
     res.json({
       hay: true,
-      base: { id: base.id, reintentos: base.reintentos },
+      base: {
+        id: base.id,
+        reintentos: base.reintentos,
+        /* En automático la plataforma no ofrece marcar a mano: la
+           llamada entra sola y marcar por su cuenta cruzaría las dos. */
+        automatica: !!base.marcacion_auto,
+        cierre_seg: base.cierre_seg,
+      },
       contacto: {
         ...c,
         datos: typeof c.datos === 'string' ? JSON.parse(c.datos || '{}') : (c.datos || {}),
