@@ -450,6 +450,76 @@ router.delete('/:id', async (req, res, next) => {
 });
 
 
+/* ── Eliminar definitivamente ──────────────────────────────────────
+   Lo normal es desactivar, no borrar. Pero una plataforma acumula
+   usuarios de prueba, y dejarlos ahí para siempre ensucia la lista.
+
+   La historia no se pierde: antes de borrar, el nombre de la persona
+   se copia a cada registro que dejó —llamadas, gestiones, respuestas y
+   auditoría—, así que los reportes siguen mostrando quién hizo qué
+   aunque el usuario ya no exista.
+
+   Solo se puede borrar a alguien ya desactivado: obliga a dar dos
+   pasos y evita borrar por accidente a quien está trabajando.        */
+router.delete('/:id/definitivo', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+
+    if (id === req.usuario.id) {
+      return res.status(400).json({ error: 'No puedes eliminarte a ti mismo' });
+    }
+
+    const u = await bd.una(
+      'SELECT nombre, usuario, extension, activo FROM usuario WHERE id = ?', [id]);
+    if (!u) return res.status(404).json({ error: 'El usuario no existe' });
+
+    if (u.activo) {
+      return res.status(409).json({
+        error: 'Primero da de baja al usuario. Eliminar definitivamente es el segundo paso.' });
+    }
+
+    /* Qué deja atrás, para informarlo */
+    const rastro = await bd.una(
+      `SELECT (SELECT COUNT(*) FROM interaccion WHERE usuario_id = ?) AS llamadas,
+              (SELECT COUNT(*) FROM pausa WHERE usuario_id = ?) AS pausas,
+              (SELECT COUNT(*) FROM formulario_respuesta WHERE usuario_id = ?) AS formularios,
+              (SELECT COUNT(*) FROM base_contacto WHERE agente_id = ?) AS gestiones`,
+      [id, id, id, id]);
+
+    await bd.transaccion(async (cx) => {
+      /* 1. El nombre queda escrito en cada registro que dejó */
+      await cx.execute(
+        'UPDATE interaccion SET agente_nombre = ? WHERE usuario_id = ?', [u.nombre, id]);
+      await cx.execute(
+        'UPDATE formulario_respuesta SET agente_nombre = ? WHERE usuario_id = ?', [u.nombre, id]);
+      await cx.execute(
+        'UPDATE base_contacto SET agente_nombre = ? WHERE agente_id = ?', [u.nombre, id]);
+      await cx.execute(
+        'UPDATE auditoria SET usuario_nombre = ? WHERE usuario_id = ?', [u.nombre, id]);
+
+      /* 2. Las pausas no se conservan: solo sirven mientras la persona
+            está en la operación, y sin ella no significan nada. */
+      await cx.execute('DELETE FROM pausa WHERE usuario_id = ?', [id]);
+      await cx.execute('DELETE FROM sesion WHERE usuario_id = ?', [id]);
+      await cx.execute('DELETE FROM usuario_campana WHERE usuario_id = ?', [id]);
+
+      /* 3. Su extensión sale de la central */
+      if (u.extension) await asterisk.eliminarExtension(cx, u.extension);
+
+      /* 4. Y por fin el usuario. Las llamadas y gestiones quedan, con
+            su nombre guardado. */
+      await cx.execute('DELETE FROM usuario WHERE id = ?', [id]);
+    });
+
+    /* Se deja registro de quién borró a quién: este es justo el dato
+       que alguien va a preguntar algún día. */
+    await auth.auditar(req.usuario.id, 'eliminar', 'usuario', id,
+      `Eliminó definitivamente a ${u.nombre} (${u.usuario})`, req.ip);
+
+    res.json({ ok: true, conservado: rastro });
+  } catch (e) { next(e); }
+});
+
 /* ── Roles disponibles ── */
 router.get('/roles/lista', async (req, res, next) => {
   try {

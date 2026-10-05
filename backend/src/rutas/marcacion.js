@@ -641,7 +641,7 @@ router.get('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
       const contactos = await bd.consultar(
         `SELECT c.id, c.telefono_1, c.telefono_2, c.nombre, c.documento, c.estado,
                 c.intentos, c.ultimo_intento, c.proximo_intento, c.agendado_para,
-                c.resultado, c.observaciones, u.nombre AS agente
+                c.resultado, c.observaciones, COALESCE(u.nombre, c.agente_nombre) AS agente
            FROM base_contacto c LEFT JOIN usuario u ON u.id = c.agente_id
           WHERE ${cond.join(' AND ')}
           ORDER BY c.id LIMIT 2000`, val);

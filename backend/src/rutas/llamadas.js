@@ -97,7 +97,7 @@ router.get('/reportes/llamadas', auth.exigirSesion, auth.exigir('reportes'), asy
     const filas = await bd.consultar(
       `SELECT i.id, i.linkedid, i.direccion, i.numero, i.inicio, i.fin,
               i.contestada, i.segundos_total, i.resultado, i.observaciones,
-              i.extension, u.nombre AS agente, c.nombre AS campana
+              i.extension, COALESCE(u.nombre, i.agente_nombre) AS agente, c.nombre AS campana
          FROM interaccion i
          LEFT JOIN usuario u ON u.id = i.usuario_id
          LEFT JOIN campana c ON c.id = i.campana_id
