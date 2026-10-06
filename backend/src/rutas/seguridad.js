@@ -24,6 +24,22 @@ const router = express.Router();
    quedaba exigiendo permisos de administrador. */
 const soloAdmin = [auth.exigirSesion, auth.exigir('usuarios')];
 
+/** Las reglas de formato, para cualquiera que esté cambiando su
+    contraseña. Solo dice qué debe cumplir: nada de bloqueos, días ni
+    historial, que son del administrador. */
+router.get('/seguridad/reglas', auth.exigirSesion, async (req, res, next) => {
+  try {
+    const p = await politica.leer();
+    res.json({
+      largo_minimo: p.largo_minimo,
+      exige_minusculas: p.exige_minusculas,
+      exige_mayusculas: p.exige_mayusculas,
+      exige_numeros: p.exige_numeros,
+      exige_especiales: p.exige_especiales,
+    });
+  } catch (e) { next(e); }
+});
+
 router.get('/seguridad/politica', soloAdmin, async (req, res, next) => {
   try {
     res.json(await politica.leer(true));
