@@ -780,4 +780,66 @@ router.post('/escucha', auth.exigirSesion, auth.exigir('escucha'), async (req, r
   } catch (e) { next(e); }
 });
 
+/* ═══════════ LLAMADAS EN COLA ═══════════
+
+   Lo que el agente ve en su escritorio: cuántas personas están
+   esperando en sus colas y desde hace cuánto.
+
+   Es solo informativo. No se puede tomar una llamada de aquí ni
+   saltarse el orden: de eso se encarga Asterisk, que reparte por
+   antigüedad. Sirve para saber si viene trabajo o si la cosa está
+   tranquila.
+
+   Los datos salen de la central en vivo, no de la base: una cola
+   cambia cada pocos segundos y un dato guardado no serviría. */
+
+router.get('/cola/mias', auth.exigirSesion, async (req, res, next) => {
+  try {
+    const yo = await bd.una(
+      'SELECT extension FROM usuario WHERE id = ?', [req.usuario.id]);
+
+    if (!yo?.extension) return res.json({ hay: false, motivo: 'Sin extensión asignada' });
+
+    if (!ami.estado().conectado) {
+      return res.json({ hay: false, motivo: 'Sin conexión con la central' });
+    }
+
+    /* En qué colas está este agente */
+    const mias = await bd.consultar(
+      'SELECT queue_name FROM queue_members WHERE interface = ?',
+      ['PJSIP/' + yo.extension]);
+
+    if (!mias.length) return res.json({ hay: false, motivo: 'No estás en ninguna cola' });
+
+    const nombres = new Set(mias.map((m) => m.queue_name));
+
+    /* Quién está esperando ahora mismo. QueueStatus devuelve un evento
+       por cada persona en espera. */
+    const esperando = await ami.listar(
+      { Action: 'QueueStatus' }, 'QueueEntry', 'QueueStatusComplete');
+
+    const llamadas = esperando
+      .filter((e) => nombres.has(e.Queue))
+      .map((e) => ({
+        cola: e.Queue,
+        posicion: Number(e.Position) || 0,
+        numero: e.CallerIDNum || e.CallerID || 'Desconocido',
+        nombre: e.CallerIDName && e.CallerIDName !== e.CallerIDNum ? e.CallerIDName : null,
+        esperando: Number(e.Wait) || 0,
+      }))
+      .sort((a, b) => a.posicion - b.posicion);
+
+    res.json({
+      hay: true,
+      colas: [...nombres],
+      total: llamadas.length,
+      llamadas: llamadas.slice(0, 20),
+    });
+  } catch (e) {
+    /* Un fallo consultando la cola no puede romperle el escritorio al
+       agente: se informa y ya. */
+    res.json({ hay: false, motivo: 'No se pudo consultar la cola' });
+  }
+});
+
 module.exports = router;
