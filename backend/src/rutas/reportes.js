@@ -223,6 +223,89 @@ router.get('/reportes/sesiones', auth.exigirSesion, auth.exigir('reportes'),
     } catch (e) { next(e); }
   });
 
+/* ═══════════ INDICADORES DEL DÍA ═══════════
+
+   Lo que un supervisor necesita saber de un vistazo: cómo va el día.
+   Es distinto del panel de agentes, que dice qué pasa en este segundo.
+
+   Se compara con ayer A LA MISMA HORA, no con el día completo de ayer.
+   Comparar las 10 de la mañana de hoy contra un día entero no diría
+   nada útil.                                                          */
+
+router.get('/vivo/indicadores', auth.exigirSesion, auth.exigir('supervision'),
+  async (req, res, next) => {
+    try {
+      const mias = await campanasDe(req.usuario);
+      const filtro = mias === null ? '' : ` AND i.campana_id IN (${mias.map(() => '?').join(',')})`;
+      const val = mias === null ? [] : mias;
+
+      if (mias !== null && !mias.length) {
+        return res.json({ hoy: {}, ayer: {}, base: null });
+      }
+
+      /* Una sola consulta para todo el día: cuenta, contestadas y
+         tiempo hablado. Separarlas sería tres viajes a la base por
+         cada refresco. */
+      const hoyDatos = await bd.una(
+        `SELECT COUNT(*) AS llamadas,
+                SUM(i.contestada = TRUE) AS contestadas,
+                SUM(IFNULL(i.segundos_total, 0)) AS segundos,
+                COUNT(DISTINCT i.usuario_id) AS agentes
+           FROM interaccion i
+          WHERE DATE(i.inicio) = CURDATE()${filtro}`, val);
+
+      /* Ayer, hasta esta misma hora */
+      const ayerDatos = await bd.una(
+        `SELECT COUNT(*) AS llamadas,
+                SUM(i.contestada = TRUE) AS contestadas
+           FROM interaccion i
+          WHERE DATE(i.inicio) = SUBDATE(CURDATE(), 1)
+            AND TIME(i.inicio) <= CURTIME()${filtro}`, val);
+
+      const llamadas = Number(hoyDatos.llamadas) || 0;
+      const contestadas = Number(hoyDatos.contestadas) || 0;
+      const segundos = Number(hoyDatos.segundos) || 0;
+
+      /* Lo que queda por llamar en las bases activas. Es lo que le dice
+         al supervisor si el día alcanza o se queda sin base a media
+         tarde. */
+      let base = null;
+      try {
+        const cond = mias === null ? '' : ` AND b.campana_id IN (${mias.map(() => '?').join(',')})`;
+        base = await bd.una(
+          `SELECT COUNT(*) AS pendientes,
+                  (SELECT COUNT(*) FROM base_contacto x
+                    JOIN base y ON y.id = x.base_id
+                   WHERE y.estado = 'activa'${mias === null ? '' :
+                     ` AND y.campana_id IN (${mias.map(() => '?').join(',')})`}) AS total
+             FROM base_contacto c JOIN base b ON b.id = c.base_id
+            WHERE b.estado = 'activa' AND c.estado IN ('pendiente','agendado')${cond}`,
+          mias === null ? [] : [...val, ...val]);
+      } catch { /* sin bases de marcación */ }
+
+      res.json({
+        hoy: {
+          llamadas,
+          contestadas,
+          noContestadas: llamadas - contestadas,
+          /* Efectiva es toda llamada contestada, sin mirar tipificación */
+          efectividad: llamadas ? Math.round((contestadas / llamadas) * 1000) / 10 : 0,
+          segundosHablados: segundos,
+          promedio: contestadas ? Math.round(segundos / contestadas) : 0,
+          agentes: Number(hoyDatos.agentes) || 0,
+        },
+        ayer: {
+          llamadas: Number(ayerDatos.llamadas) || 0,
+          contestadas: Number(ayerDatos.contestadas) || 0,
+        },
+        base: base && Number(base.total) ? {
+          pendientes: Number(base.pendientes) || 0,
+          total: Number(base.total) || 0,
+        } : null,
+      });
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ DESCARGAS ═══════════
 
    El archivo lo arma el servidor. Podría hacerse en el navegador, pero
