@@ -78,6 +78,23 @@ router.post('/llamadas', auth.exigirSesion, async (req, res, next) => {
 });
 
 /* ═══════════ REPORTE ═══════════ */
+/** Las campañas de un supervisor. `null` significa "todas", que es lo
+    que corresponde a un administrador. */
+async function campanasDelSupervisor(usuario) {
+  if (usuario.rol === 'admin') return null;
+
+  const filas = await bd.consultar(
+    'SELECT campana_id FROM usuario_campana WHERE usuario_id = ?', [usuario.id]);
+  const ids = filas.map((f) => f.campana_id);
+
+  /* Si no tiene campañas asignadas, se usa la de su ficha */
+  if (!ids.length) {
+    const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [usuario.id]);
+    if (yo?.campana_id) ids.push(yo.campana_id);
+  }
+  return ids;
+}
+
 router.get('/reportes/llamadas', auth.exigirSesion, auth.exigir('reportes'), async (req, res, next) => {
   try {
     const { desde, hasta, extension, numero, estado } = req.query;
@@ -93,6 +110,23 @@ router.get('/reportes/llamadas', auth.exigirSesion, auth.exigir('reportes'), asy
     if (numero)    { cond.push('i.numero LIKE ?'); val.push('%' + String(numero).replace(/\D/g, '') + '%'); }
     if (estado === 'contestada')    cond.push('i.contestada = TRUE');
     if (estado === 'no_contestada') cond.push('i.contestada = FALSE');
+
+    /* Un supervisor solo ve las llamadas de sus campañas. Esto se
+       comprueba aquí y no en la pantalla: cualquiera podría pedir la
+       dirección a mano y ver lo que no le corresponde.
+       El administrador no lleva filtro: ve la operación completa. */
+    const mias = await campanasDelSupervisor(req.usuario);
+    if (mias !== null) {
+      if (!mias.length) {
+        return res.json({
+          resumen: { total: 0, contestadas: 0, noContestadas: 0,
+                     segundosHablados: 0, promedio: 0 },
+          llamadas: [],
+        });
+      }
+      cond.push(`i.campana_id IN (${mias.map(() => '?').join(',')})`);
+      val.push(...mias);
+    }
 
     const filas = await bd.consultar(
       `SELECT i.id, i.linkedid, i.direccion, i.numero, i.inicio, i.fin,
