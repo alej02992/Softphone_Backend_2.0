@@ -107,7 +107,10 @@ router.get('/bases/:id', auth.exigirSesion, auth.exigir('marcacion'), async (req
 function simultaneasDe(b) {
   const n = Number(b.simultaneas);
   if (!Number.isFinite(n) || n < 1) return 1;
-  return Math.min(n, 2);
+  /* El tope existe para que nadie escriba un número que sature la
+     troncal: con 5 por agente, diez agentes libres piden cincuenta
+     llamadas a la vez. */
+  return Math.min(n, 5);
 }
 
 /* Segundos de cierre: de 0 a 5 minutos. Con 0, la siguiente llamada
