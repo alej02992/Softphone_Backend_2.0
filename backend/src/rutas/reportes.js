@@ -397,8 +397,16 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
 
       if (formato === 'pdf') {
         const PDFDocument = require('pdfkit');
+        const fs = require('fs');
+        const CONFIG = require('../config');
         /* Horizontal: estos reportes tienen muchas columnas */
-        const doc = new PDFDocument({ size: 'LETTER', layout: 'landscape', margin: 30 });
+        const doc = new PDFDocument({
+          size: 'LETTER', layout: 'landscape', margin: 30,
+          /* Se guardan las páginas en memoria para numerarlas al final,
+             cuando ya se sabe cuántas son. */
+          bufferPages: true,
+          info: { Title: titulo, Author: 'BPM Consulting' },
+        });
         const trozos = [];
         doc.on('data', (t) => trozos.push(t));
 
@@ -411,17 +419,41 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
         const suma = pesos.reduce((a, b) => a + b, 0);
         const anchos = pesos.map((p) => (p / suma) * ancho);
 
-        const cabecera = () => {
-          doc.fontSize(13).fillColor('#0d5c63').text(titulo, 30, 25);
-          doc.fontSize(8).fillColor('#666')
-             .text(`BPM Consulting · ${periodo || 'Sin periodo'} · ${filas.length} registros`, 30, 43);
-          doc.moveTo(30, 58).lineTo(doc.page.width - 30, 58).strokeColor('#0d5c63').stroke();
+        /* El logo de la empresa. Si el archivo no está, el reporte sale
+           igual con el nombre escrito: un reporte sin logo sirve, uno
+           que no se genera no. */
+        const rutaLogo = CONFIG.marca && CONFIG.marca.logo;
+        let hayLogo = false;
+        try { hayLogo = !!rutaLogo && fs.existsSync(rutaLogo); } catch { hayLogo = false; }
 
+        const cabecera = () => {
           let x = 30;
-          doc.fontSize(7.5).fillColor('#0d5c63');
+
+          if (hayLogo) {
+            try {
+              doc.image(rutaLogo, 30, 22, { height: 26 });
+              x = 30 + 92;                 // el texto arranca tras el logo
+            } catch { hayLogo = false; }   // imagen ilegible: se sigue sin ella
+          }
+
+          doc.fontSize(13).fillColor('#002E44').text(titulo, x, 25);
+          doc.fontSize(8).fillColor('#666')
+             .text(`BPM Consulting · ${periodo || 'Sin periodo'} · ${filas.length} registros`, x, 43);
+
+          /* Fecha de generación: un reporte impreso sin fecha no sirve
+             de nada dos semanas después. */
+          doc.fontSize(7.5).fillColor('#8B979F')
+             .text(`Generado el ${new Date().toLocaleString('es-CO', { hour12: false }).slice(0, 16)}`,
+                   doc.page.width - 230, 27, { width: 200, align: 'right' });
+
+          doc.moveTo(30, 58).lineTo(doc.page.width - 30, 58)
+             .strokeColor('#00BFFC').lineWidth(1.5).stroke();
+
+          let cx = 30;
+          doc.fontSize(7.5).fillColor('#002E44');
           columnas.forEach(([, etiqueta], i) => {
-            doc.text(etiqueta, x + 2, 64, { width: anchos[i] - 4, ellipsis: true });
-            x += anchos[i];
+            doc.text(etiqueta, cx + 2, 64, { width: anchos[i] - 4, ellipsis: true });
+            cx += anchos[i];
           });
           return 78;
         };
@@ -443,6 +475,26 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
           });
           y += 13;
         });
+
+        /* El pie con la numeración, al final: hasta aquí no se sabía
+           cuántas páginas iba a tener el reporte. */
+        const paginas = doc.bufferedPageRange();
+        for (let p = 0; p < paginas.count; p++) {
+          doc.switchToPage(paginas.start + p);
+
+          /* El margen inferior se anula mientras se escribe el pie: si
+             no, pdfkit cree que el texto no cabe y agrega una página
+             en blanco por cada pie, duplicando el documento. */
+          const margenAbajo = doc.page.margins.bottom;
+          doc.page.margins.bottom = 0;
+
+          doc.fontSize(7).fillColor('#8B979F')
+             .text(`BPM Consulting · Página ${p + 1} de ${paginas.count}`,
+                   30, doc.page.height - 26,
+                   { width: doc.page.width - 60, align: 'center', lineBreak: false });
+
+          doc.page.margins.bottom = margenAbajo;
+        }
 
         doc.end();
         await listo;

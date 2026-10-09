@@ -53,12 +53,6 @@ const CONFIG = {
      El proveedor se elige aquí: si mañana cambia, no se toca el código.
      Con un servicio en la nube, el texto del mensaje sale del servidor,
      así que conviene revisarlo con jurídico antes de usar datos reales. */
-
-     grabaciones: {
-      ruta: process.env.GRABACIONES_RUTA || '/var/spool/asterisk/monitor',
-      minimoBytes: Number(process.env.GRABACIONES_MINIMO) || 10240,
-     },
-
   tts: {
     proveedor:     process.env.TTS_PROVEEDOR || 'ninguno',
     clave:         process.env.TTS_CLAVE || '',
@@ -85,7 +79,7 @@ const CONFIG = {
     claveEntrega: process.env.SMS_CLAVE_ENTREGA || '',
   },
 
-/* ── Canal con Asterisk ──
+  /* ── Canal con Asterisk ──
      Conexión permanente para originar llamadas y recibir eventos. Es
      la llave completa de la central: debe escuchar solo en 127.0.0.1
      y con una clave larga. */
@@ -95,6 +89,18 @@ const CONFIG = {
     puerto:  Number(process.env.AMI_PUERTO) || 5038,
     usuario: process.env.AMI_USUARIO || '',
     clave:   process.env.AMI_CLAVE || '',
+  },
+
+  /* Contexto del plan de marcación que ejecuta ChanSpy */
+  escucha: {
+    contexto: process.env.ESCUCHA_CONTEXTO || 'bpm-escucha',
+  },
+
+  /* ── Marca ──
+     El logo que aparece en los reportes en PDF. Si el archivo no está,
+     los reportes salen igual, solo que sin logo. */
+  marca: {
+    logo: process.env.LOGO_RUTA || '/var/www/html/bpm/img/bpm-blanco.png',
   },
 
   realtime: process.env.REALTIME === 'true',
