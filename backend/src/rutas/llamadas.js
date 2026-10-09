@@ -81,15 +81,81 @@ router.post('/llamadas', auth.exigirSesion, async (req, res, next) => {
        que la marcación se detuviera después de dos. */
     if (resultado) {
       try {
-        await bd.consultar(
-          `UPDATE base_contacto
-              SET estado = 'gestionado', gestionado_en = NOW(),
-                  resultado = ?, observaciones = COALESCE(observaciones, ?),
-                  intentos = intentos + 1, ultimo_intento = NOW()
-            WHERE agente_id = ? AND estado = 'asignado'
-              AND (telefono_1 = ? OR telefono_2 = ?)`,
-          [resultado, (b.observaciones || '').slice(0, 2000) || null,
-           req.usuario.id, numero, numero]);
+        /* Qué hay que hacer con el contacto según la tipificación que
+           eligió el agente. Una tipificación no es solo un registro:
+           dice si se reintenta, si se usa el otro teléfono, si se
+           agenda o si no se vuelve a llamar nunca. */
+        const t = tipId
+          ? await bd.una('SELECT accion FROM tipificacion WHERE id = ?', [tipId])
+          : null;
+        const accion = t?.accion || 'cerrar';
+
+        const c = await bd.una(
+          `SELECT c.id, c.telefono_1, c.telefono_2, c.intentos, b.reintentos, b.intervalo_min
+             FROM base_contacto c JOIN base b ON b.id = c.base_id
+            WHERE c.agente_id = ? AND c.estado = 'asignado'
+              AND (c.telefono_1 = ? OR c.telefono_2 = ?)
+            LIMIT 1`, [req.usuario.id, numero, numero]);
+
+        if (c) {
+          const obs = (b.observaciones || '').slice(0, 2000) || null;
+          const intentos = (c.intentos || 0) + 1;
+
+          /* Reintentar y usar el otro teléfono comparten la mecánica:
+             el contacto vuelve a la cola con una hora futura. Se
+             respetan los reintentos de la base para no llamar sin
+             límite a la misma persona. */
+          const vuelveALaCola = ['reintentar', 'otro_telefono'].includes(accion)
+            && intentos <= (c.reintentos ?? 2);
+
+          if (vuelveALaCola) {
+            await bd.consultar(
+              `UPDATE base_contacto
+                  SET estado = 'pendiente', intentos = ?, ultimo_intento = NOW(),
+                      proximo_intento = ?, resultado = ?, observaciones = ?,
+                      agente_id = NULL, asignado_en = NULL, colgado_en = NULL
+                WHERE id = ?`,
+              [intentos, new Date(Date.now() + (c.intervalo_min || 60) * 60000),
+               resultado, obs, c.id]);
+
+          } else if (accion === 'agendar' && b.agendado_para) {
+            await bd.consultar(
+              `UPDATE base_contacto
+                  SET estado = 'agendado', agendado_para = ?, intentos = ?,
+                      ultimo_intento = NOW(), resultado = ?, observaciones = ?,
+                      agente_id = NULL, asignado_en = NULL, colgado_en = NULL,
+                      proximo_intento = NULL
+                WHERE id = ?`,
+              [new Date(b.agendado_para), intentos, resultado, obs, c.id]);
+
+          } else {
+            /* Cerrar, o reintentar sin intentos disponibles */
+            await bd.consultar(
+              `UPDATE base_contacto
+                  SET estado = ?, gestionado_en = NOW(), resultado = ?,
+                      observaciones = COALESCE(observaciones, ?),
+                      intentos = ?, ultimo_intento = NOW()
+                WHERE id = ?`,
+              [accion === 'cerrar' ? 'gestionado' : 'sin_contacto',
+               resultado, obs, intentos, c.id]);
+          }
+
+          /* Si el cliente pidió no ser contactado, el número sale de
+             todas las campañas, no solo de esta base. */
+          if (accion === 'no_llamar') {
+            await bd.consultar(
+              'INSERT IGNORE INTO no_llamar (numero, motivo) VALUES (?, ?)',
+              [c.telefono_1, (resultado || 'Lo pidió el cliente').slice(0, 160)]);
+            await bd.consultar(
+              "UPDATE base_contacto SET estado = 'excluido' WHERE id = ?", [c.id]);
+          }
+        } else if (accion === 'no_llamar') {
+          /* La llamada no venía de una base, pero igual pidió que no
+             lo llamen: el número se excluye de todas formas. */
+          await bd.consultar(
+            'INSERT IGNORE INTO no_llamar (numero, motivo) VALUES (?, ?)',
+            [numero, (resultado || 'Lo pidió el cliente').slice(0, 160)]);
+        }
       } catch { /* si no venía de una base, no hay nada que cerrar */ }
     }
 
@@ -117,14 +183,21 @@ async function campanasDelSupervisor(usuario) {
 
 router.get('/reportes/llamadas', auth.exigirSesion, auth.exigir('reportes'), async (req, res, next) => {
   try {
-    const { desde, hasta, extension, numero, estado } = req.query;
+    const { desde, hasta, extension, numero, estado, desdeHora, hastaHora } = req.query;
     const cond = [];
     const val = [];
 
     /* Sin fechas, el día de hoy: lo primero que se quiere ver es la
        llamada que se acaba de hacer. */
-    cond.push('i.inicio >= ?'); val.push((desde || hoy()) + ' 00:00:00');
-    cond.push('i.inicio <= ?'); val.push((hasta || desde || hoy()) + ' 23:59:59');
+    cond.push('i.inicio >= ?'); val.push((desde || hoy()) + ' ' + (desdeHora || '00:00') + ':00');
+    cond.push('i.inicio <= ?'); val.push((hasta || desde || hoy()) + ' ' + (hastaHora || '23:59') + ':59');
+
+    /* Con varios días, la hora acota la franja de CADA día: así se
+       puede ver "de 8 a 10 de la mañana toda la semana". */
+    if ((desdeHora || hastaHora) && hasta && hasta !== desde) {
+      cond.push('TIME(i.inicio) BETWEEN ? AND ?');
+      val.push((desdeHora || '00:00') + ':00', (hastaHora || '23:59') + ':59');
+    }
 
     if (extension) { cond.push('i.extension = ?'); val.push(extension); }
     if (numero)    { cond.push('i.numero LIKE ?'); val.push('%' + String(numero).replace(/\D/g, '') + '%'); }

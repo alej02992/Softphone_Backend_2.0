@@ -58,8 +58,17 @@ router.get('/reportes/tipificaciones', auth.exigirSesion, auth.exigir('reportes'
       const cond = ['i.resultado IS NOT NULL'];
       const val = [];
 
-      cond.push('i.inicio >= ?'); val.push((desde || hoy()) + ' 00:00:00');
-      cond.push('i.inicio <= ?'); val.push((hasta || desde || hoy()) + ' 23:59:59');
+      const { desdeHora, hastaHora } = req.query;
+
+      cond.push('i.inicio >= ?'); val.push((desde || hoy()) + ' ' + (desdeHora || '00:00') + ':00');
+      cond.push('i.inicio <= ?'); val.push((hasta || desde || hoy()) + ' ' + (hastaHora || '23:59') + ':59');
+
+      /* Con varios días, la hora acota la franja de CADA día: así se
+         puede ver "de 8 a 10 de la mañana toda la semana". */
+      if ((desdeHora || hastaHora) && hasta && hasta !== desde) {
+        cond.push('TIME(i.inicio) BETWEEN ? AND ?');
+        val.push((desdeHora || '00:00') + ':00', (hastaHora || '23:59') + ':59');
+      }
 
       if (extension) { cond.push('i.extension = ?'); val.push(extension); }
       if (resultado) { cond.push('i.resultado LIKE ?'); val.push('%' + resultado + '%'); }
@@ -135,8 +144,16 @@ router.get('/reportes/sesiones', auth.exigirSesion, auth.exigir('reportes'),
       const cond = [];
       const val = [];
 
-      cond.push('s.inicio >= ?'); val.push((desde || hoy()) + ' 00:00:00');
-      cond.push('s.inicio <= ?'); val.push((hasta || desde || hoy()) + ' 23:59:59');
+      const { desdeHora, hastaHora } = req.query;
+
+      cond.push('s.inicio >= ?'); val.push((desde || hoy()) + ' ' + (desdeHora || '00:00') + ':00');
+      cond.push('s.inicio <= ?'); val.push((hasta || desde || hoy()) + ' ' + (hastaHora || '23:59') + ':59');
+
+      if ((desdeHora || hastaHora) && hasta && hasta !== desde) {
+        cond.push('TIME(s.inicio) BETWEEN ? AND ?');
+        val.push((desdeHora || '00:00') + ':00', (hastaHora || '23:59') + ':59');
+      }
+
       if (extension) { cond.push('u.extension = ?'); val.push(extension); }
 
       const mias = await campanasDe(req.usuario);
@@ -219,6 +236,155 @@ router.get('/reportes/sesiones', auth.exigirSesion, auth.exigir('reportes'),
             ? Math.round((totalPausa / totalConectado) * 1000) / 10 : 0,
         },
         sesiones: sesiones.map(({ _conectado, _pausa, ...resto }) => resto),
+      });
+    } catch (e) { next(e); }
+  });
+
+/* ═══════════ REPORTE DE FORMULARIOS ═══════════
+
+   Este reporte no puede tener columnas fijas como los otros: cada
+   formulario tiene las suyas. Uno de cobranza pregunta por el motivo
+   de no pago; uno de soporte, por el tipo de falla.
+
+   Por eso primero se elige el formulario y después se arma la tabla
+   con sus campos. Las columnas vienen del propio formulario, no de una
+   lista escrita a mano.                                               */
+
+/** Los formularios que este supervisor puede consultar. */
+router.get('/reportes/formularios', auth.exigirSesion, auth.exigir('reportes'),
+  async (req, res, next) => {
+    try {
+      const mias = await campanasDe(req.usuario);
+      let sql = `SELECT f.id, f.nombre, c.nombre AS campana,
+                        (SELECT COUNT(*) FROM formulario_respuesta x
+                          WHERE x.formulario_id = f.id) AS respuestas
+                   FROM formulario f LEFT JOIN campana c ON c.id = f.campana_id`;
+      const val = [];
+
+      if (mias !== null) {
+        if (!mias.length) return res.json([]);
+        sql += ` WHERE f.campana_id IN (${mias.map(() => '?').join(',')})`;
+        val.push(...mias);
+      }
+      sql += ' ORDER BY f.nombre';
+
+      res.json(await bd.consultar(sql, val));
+    } catch (e) { next(e); }
+  });
+
+/** Las respuestas de un formulario, una fila por gestión. */
+router.get('/reportes/formularios/:id', auth.exigirSesion, auth.exigir('reportes'),
+  async (req, res, next) => {
+    try {
+      const formularioId = Number(req.params.id);
+      const { desde, hasta, desdeHora, hastaHora, extension } = req.query;
+
+      const f = await bd.una(
+        'SELECT id, nombre, campana_id FROM formulario WHERE id = ?', [formularioId]);
+      if (!f) return res.status(404).json({ error: 'Ese formulario no existe' });
+
+      const mias = await campanasDe(req.usuario);
+      if (mias !== null && !mias.includes(f.campana_id)) {
+        return res.status(403).json({ error: 'Ese formulario no es de tus campañas' });
+      }
+
+      /* Los campos, en el orden en que los ve el agente: así la tabla
+         se lee igual que el formulario. */
+      const campos = await bd.consultar(
+        `SELECT id, etiqueta, tipo, opciones FROM formulario_campo
+          WHERE formulario_id = ? ORDER BY orden, id`, [formularioId]);
+
+      const cond = ['r.formulario_id = ?'];
+      const val = [formularioId];
+
+      cond.push('r.creada >= ?'); val.push((desde || hoy()) + ' ' + (desdeHora || '00:00') + ':00');
+      cond.push('r.creada <= ?'); val.push((hasta || desde || hoy()) + ' ' + (hastaHora || '23:59') + ':59');
+
+      if ((desdeHora || hastaHora) && hasta && hasta !== desde) {
+        cond.push('TIME(r.creada) BETWEEN ? AND ?');
+        val.push((desdeHora || '00:00') + ':00', (hastaHora || '23:59') + ':59');
+      }
+      if (extension) { cond.push('u.extension = ?'); val.push(extension); }
+
+      const cabeceras = await bd.consultar(
+        `SELECT r.id, r.creada, r.numero, r.interaccion_id,
+                COALESCE(u.nombre, r.agente_nombre) AS agente, u.extension,
+                i.resultado AS tipificacion
+           FROM formulario_respuesta r
+           LEFT JOIN usuario u ON u.id = r.usuario_id
+           LEFT JOIN interaccion i ON i.id = r.interaccion_id
+          WHERE ${cond.join(' AND ')}
+          ORDER BY r.creada DESC
+          LIMIT 2000`, val);
+
+      /* Los valores de todas esas respuestas en una sola consulta: uno
+         por respuesta serían cientos de viajes a la base. */
+      const valores = cabeceras.length
+        ? await bd.consultar(
+            `SELECT respuesta_id, campo_id, valor FROM formulario_valor
+              WHERE respuesta_id IN (${cabeceras.map(() => '?').join(',')})`,
+            cabeceras.map((c) => c.id))
+        : [];
+
+      const porRespuesta = new Map();
+      valores.forEach((v) => {
+        if (!porRespuesta.has(v.respuesta_id)) porRespuesta.set(v.respuesta_id, {});
+        porRespuesta.get(v.respuesta_id)[v.campo_id] = v.valor;
+      });
+
+      const filas = cabeceras.map((c) => {
+        const vals = porRespuesta.get(c.id) || {};
+        const fila = {
+          fecha: fecha(c.creada),
+          hora: hora(c.creada),
+          agente: c.agente || '—',
+          extension: c.extension || '—',
+          numero: c.numero || '—',
+          tipificacion: c.tipificacion || '—',
+        };
+        campos.forEach((campo) => {
+          fila['campo_' + campo.id] = vals[campo.id] ?? '';
+        });
+        return fila;
+      });
+
+      /* Resumen solo de las preguntas con opciones: en esas, saber que
+         el 60% respondió lo mismo vale más que leer 300 filas. En las
+         de texto libre no diría nada. */
+      const resumen = campos
+        .filter((campo) => ['lista', 'opciones', 'si_no', 'select', 'radio']
+          .includes(String(campo.tipo)))
+        .map((campo) => {
+          const cuenta = new Map();
+          filas.forEach((f2) => {
+            const v = String(f2['campo_' + campo.id] || '').trim();
+            if (v) cuenta.set(v, (cuenta.get(v) || 0) + 1);
+          });
+          const total = [...cuenta.values()].reduce((a, b) => a + b, 0);
+          return {
+            etiqueta: campo.etiqueta,
+            total,
+            opciones: [...cuenta.entries()]
+              .map(([valor, n]) => ({
+                valor, cantidad: n,
+                porcentaje: total ? Math.round((n / total) * 1000) / 10 : 0,
+              }))
+              .sort((a, b) => b.cantidad - a.cantidad),
+          };
+        })
+        .filter((x) => x.total);
+
+      res.json({
+        formulario: f.nombre,
+        /* Las columnas fijas y después una por cada campo */
+        columnas: [
+          ['fecha', 'Fecha'], ['hora', 'Hora'], ['agente', 'Agente'],
+          ['numero', 'Número'], ['tipificacion', 'Tipificación'],
+          ...campos.map((c) => ['campo_' + c.id, c.etiqueta]),
+        ],
+        resumen: { respuestas: filas.length, campos: campos.length },
+        reparto: resumen,
+        respuestas: filas,
       });
     } catch (e) { next(e); }
   });
@@ -337,6 +503,7 @@ const TITULOS = {
   llamadas: 'Reporte de llamadas',
   tipificaciones: 'Reporte de tipificación',
   sesiones: 'Reporte de inicio de sesión',
+  formularios: 'Reporte de formularios',
 };
 
 router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
@@ -347,14 +514,18 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
       const filas = Array.isArray(req.body.filas) ? req.body.filas : [];
       const periodo = String(req.body.periodo || '');
 
-      const columnas = COLUMNAS[reporte];
+      /* El reporte de formularios trae sus propias columnas, porque
+         cada formulario tiene las suyas. Los demás las tienen fijas. */
+      const columnas = Array.isArray(req.body.columnas) && req.body.columnas.length
+        ? req.body.columnas.slice(0, 40)
+        : COLUMNAS[reporte];
       if (!columnas) return res.status(400).json({ error: 'Reporte desconocido' });
       if (!filas.length) return res.status(400).json({ error: 'No hay datos que exportar' });
       if (filas.length > 5000) {
         return res.status(400).json({ error: 'Demasiadas filas. Acota el rango de fechas.' });
       }
 
-      const titulo = TITULOS[reporte];
+      const titulo = TITULOS[reporte] || 'Reporte';
       const nombre = `${reporte}_${new Date().toISOString().slice(0, 10)}`;
 
       if (formato === 'csv') {
