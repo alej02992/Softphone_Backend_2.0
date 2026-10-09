@@ -584,11 +584,35 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
         const listo = new Promise((resolver) => doc.on('end', resolver));
 
         const ancho = doc.page.width - 60;
-        /* La columna de observaciones necesita más espacio que las demás */
-        const pesos = columnas.map(([c]) =>
-          c === 'observaciones' ? 2.4 : c === 'agente' ? 1.5 : c === 'resultado' ? 1.8 : 1);
+
+        /* Unas columnas necesitan más espacio que otras. Las de
+           formularios no están en esta lista porque sus nombres los
+           pone el administrador: a esas se les da peso según lo largo
+           de su título. */
+        const pesoDe = ([clave, etiqueta]) => {
+          if (clave === 'observaciones') return 2.4;
+          if (clave === 'resultado') return 1.8;
+          if (clave === 'agente' || clave === 'campana') return 1.5;
+          if (clave === 'fecha' || clave === 'hora' || clave === 'extension') return 0.8;
+          /* Las columnas de formulario: más ancho si el título es largo */
+          if (String(clave).startsWith('campo_')) {
+            return Math.min(2.2, Math.max(1, String(etiqueta).length / 10));
+          }
+          return 1;
+        };
+
+        const pesos = columnas.map(pesoDe);
         const suma = pesos.reduce((a, b) => a + b, 0);
         const anchos = pesos.map((p) => (p / suma) * ancho);
+
+        /* Con muchas columnas, la letra baja para que quepa el texto.
+           Era lo que hacía que las letras se montaran unas sobre otras
+           en los reportes de formularios con muchas preguntas. */
+        const cuerpoPt = columnas.length > 12 ? 5.5
+          : columnas.length > 9 ? 6
+          : columnas.length > 7 ? 6.5 : 7;
+        const tituloPt = cuerpoPt + 0.5;
+        const alto = cuerpoPt + 4;
 
         /* El logo de la empresa. Si el archivo no está, el reporte sale
            igual con el nombre escrito: un reporte sin logo sirve, uno
@@ -621,30 +645,62 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
              .strokeColor('#00BFFC').lineWidth(1.5).stroke();
 
           let cx = 30;
-          doc.fontSize(7.5).fillColor('#002E44');
+          doc.fontSize(tituloPt).fillColor('#002E44');
+
+          /* El título de cada columna puede ocupar dos líneas: con
+             preguntas largas, en una sola no cabe. */
+          let altoCabecera = 0;
           columnas.forEach(([, etiqueta], i) => {
-            doc.text(etiqueta, cx + 2, 64, { width: anchos[i] - 4, ellipsis: true });
+            const texto = String(etiqueta);
+            const h = doc.heightOfString(texto, { width: anchos[i] - 4 });
+            altoCabecera = Math.max(altoCabecera, Math.min(h, tituloPt * 2.6));
+            doc.text(texto, cx + 2, 64, {
+              width: anchos[i] - 4, height: tituloPt * 2.6, ellipsis: true,
+            });
             cx += anchos[i];
           });
-          return 78;
+
+          doc.moveTo(30, 66 + altoCabecera).lineTo(doc.page.width - 30, 66 + altoCabecera)
+             .strokeColor('#DDE3E8').lineWidth(0.5).stroke();
+
+          return 70 + altoCabecera;
         };
 
         let y = cabecera();
 
+        doc.fontSize(cuerpoPt);
+
         filas.forEach((f, n) => {
-          if (y > doc.page.height - 45) { doc.addPage(); y = cabecera(); }
+          /* Cuánto mide la fila más alta de esta línea. Antes la altura
+             era fija: si un texto ocupaba dos líneas, se salía por
+             debajo y se montaba sobre la fila siguiente. */
+          let altoFila = alto;
+          columnas.forEach(([clave], i) => {
+            const texto = String(f[clave] ?? '');
+            if (!texto) return;
+            const h = doc.heightOfString(texto, { width: anchos[i] - 4 });
+            /* Tres líneas como máximo: más que eso, se recorta */
+            altoFila = Math.max(altoFila, Math.min(h + 3, cuerpoPt * 3.8));
+          });
+
+          if (y + altoFila > doc.page.height - 42) { doc.addPage(); y = cabecera(); }
 
           if (n % 2) {
-            doc.rect(30, y - 2, ancho, 13).fillColor('#f6f8fa').fill();
+            doc.rect(30, y - 2, ancho, altoFila).fillColor('#f6f8fa').fill();
           }
 
           let x = 30;
-          doc.fontSize(7).fillColor('#1b1f24');
+          doc.fontSize(cuerpoPt).fillColor('#1b1f24');
           columnas.forEach(([clave], i) => {
-            doc.text(String(f[clave] ?? ''), x + 2, y, { width: anchos[i] - 4, ellipsis: true });
+            doc.text(String(f[clave] ?? ''), x + 2, y, {
+              width: anchos[i] - 4,
+              height: altoFila - 2,
+              ellipsis: true,
+            });
             x += anchos[i];
           });
-          y += 13;
+
+          y += altoFila;
         });
 
         /* El pie con la numeración, al final: hasta aquí no se sabía
