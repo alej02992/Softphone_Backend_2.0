@@ -89,6 +89,15 @@ async function agentesLibres(campanaId) {
       WHERE u.activo = TRUE
         AND u.campana_id = ?
         AND u.extension IS NOT NULL
+
+        /* Solo agentes. Un supervisor también tiene extensión y sesión
+           abierta —la necesita para escuchar llamadas—, pero no está
+           ahí para atender la base. Sin esta condición, el motor le
+           empezaba a marcar como si fuera uno más. */
+        AND NOT EXISTS (
+          SELECT 1 FROM rol_permiso rp
+            JOIN permiso p ON p.id = rp.permiso_id
+           WHERE rp.rol_id = u.rol_id AND p.clave = 'supervision')
         AND NOT EXISTS (SELECT 1 FROM pausa p
                          WHERE p.usuario_id = u.id AND p.fin IS NULL)
         /* Ocupado mientras tenga una llamada en curso, o mientras le
@@ -211,7 +220,14 @@ async function vuelta() {
     try { ocupadas = await ami.extensionesEnLlamada(); }
     catch { /* si falla la consulta, se sigue con lo que se sabe */ }
 
-    /*  Quién ya colgó ── si el agente tiene un contacto
+    /* ── Quién ya colgó ──
+
+       El fin de la llamada se detectaba solo con el aviso de Asterisk,
+       cruzado por el nombre del canal. Si ese nombre no coincidía
+       exactamente, el contacto se quedaba "en manos" del agente para
+       siempre y el motor no le volvía a mandar ninguna llamada.
+
+       Ahora se mira la realidad: si el agente tiene un contacto
        asignado y su extensión NO está en ninguna llamada, es que ya
        colgó. Desde ahí corre su tiempo de cierre. */
     const enMano = await bd.consultar(
