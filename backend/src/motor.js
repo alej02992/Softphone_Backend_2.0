@@ -203,7 +203,6 @@ async function vuelta() {
   trabajando = true;
   try {
     await soltarAtascadas();
-    await cerrarVencidas();
 
     /* Quién está hablando ahora mismo, según la central. Si un agente
        marcó por su cuenta, no se le manda una llamada automática
@@ -211,6 +210,28 @@ async function vuelta() {
     let ocupadas = new Set();
     try { ocupadas = await ami.extensionesEnLlamada(); }
     catch { /* si falla la consulta, se sigue con lo que se sabe */ }
+
+    /*  Quién ya colgó ── si el agente tiene un contacto
+       asignado y su extensión NO está en ninguna llamada, es que ya
+       colgó. Desde ahí corre su tiempo de cierre. */
+    const enMano = await bd.consultar(
+      `SELECT c.id, u.extension
+         FROM base_contacto c JOIN usuario u ON u.id = c.agente_id
+        WHERE c.estado = 'asignado' AND c.colgado_en IS NULL`);
+
+    for (const c of enMano) {
+      if (!ocupadas.has(String(c.extension))) {
+        await bd.consultar(
+          'UPDATE base_contacto SET colgado_en = NOW() WHERE id = ? AND colgado_en IS NULL',
+          [c.id]);
+      }
+    }
+
+    /* El cierre va DESPUÉS de detectar quién colgó, en la misma vuelta.
+       Si fuera antes, haría falta una vuelta para notar que colgó y
+       otra para cerrar: el agente esperaría su tiempo de cierre más dos
+       vueltas enteras entre llamada y llamada. */
+    await cerrarVencidas();
 
     for (const base of await basesActivas()) {
       const todos = await agentesLibres(base.campana_id);

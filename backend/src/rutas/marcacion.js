@@ -322,6 +322,7 @@ router.post('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
         const t2 = limpiar(f.telefono_2 || f.telefono2 || f.celular_2 || f.otro_telefono);
         const nombre = String(f.nombre || '').trim();
         const documento = String(f.documento || f.cedula || '').trim();
+        const correo = String(f.correo || f.email || '').trim();
         const errores = [];
 
         /* Toda columna que no sea de las conocidas queda como dato
@@ -330,20 +331,24 @@ router.post('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
         Object.entries(f).forEach(([k, v]) => {
           const clave = k.trim().toLowerCase();
           if (['telefono_1', 'telefono', 'numero', 'celular', 'telefono_2', 'telefono2',
-               'celular_2', 'otro_telefono', 'nombre', 'documento', 'cedula'].includes(clave)) return;
+               'celular_2', 'otro_telefono', 'nombre', 'documento', 'cedula',
+               'correo', 'email'].includes(clave)) return;
           if (String(v ?? '').trim()) datos[clave] = String(v).trim();
         });
 
         if (!t1) errores.push('Falta el teléfono');
         else if (!valido(t1)) errores.push('El teléfono no parece válido');
         if (t2 && !valido(t2)) errores.push('El segundo teléfono no parece válido');
+        if (correo && !/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(correo)) {
+          errores.push('El correo no parece válido');
+        }
         if (t1 && vistos.has(t1)) errores.push('Ese teléfono está repetido en el archivo');
         if (t1) vistos.add(t1);
         if (t1 && yaEstan.has(t1)) errores.push('Ese teléfono ya está en la base');
         if (t1 && excluidos.has(t1)) errores.push('Ese número pidió no ser llamado');
 
         return { linea: i + 2, telefono_1: t1, telefono_2: t2 || null,
-                 nombre, documento, datos, errores };
+                 nombre, documento, correo, datos, errores };
       });
 
       const validas = revisadas.filter((r) => !r.errores.length);
@@ -356,8 +361,8 @@ router.post('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
           conError: revisadas.length - validas.length,
           conSegundo: validas.filter((r) => r.telefono_2).length,
           columnas: [...new Set(validas.flatMap((r) => Object.keys(r.datos)))],
-          filas: revisadas.map(({ linea, telefono_1, telefono_2, nombre, errores }) =>
-            ({ linea, telefono_1, telefono_2, nombre, errores })),
+          filas: revisadas.map(({ linea, telefono_1, telefono_2, nombre, correo, errores }) =>
+            ({ linea, telefono_1, telefono_2, nombre, correo, errores })),
         });
       }
 
@@ -365,11 +370,51 @@ router.post('/bases/:id/contactos', auth.exigirSesion, auth.exigir('marcacion'),
       for (const r of validas) {
         try {
           await bd.consultar(
-            `INSERT INTO base_contacto (base_id, telefono_1, telefono_2, nombre, documento, datos)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO base_contacto (base_id, telefono_1, telefono_2, nombre,
+                                        documento, correo, datos)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [id, r.telefono_1, r.telefono_2, r.nombre || null, r.documento || null,
-             JSON.stringify(r.datos)]);
+             r.correo || null, JSON.stringify(r.datos)]);
           cargados++;
+
+          /* ── También a la agenda ──
+             La ficha que ve el agente al entrar una llamada sale de la
+             tabla de contactos, no de la base de marcación. Sin esto,
+             el agente llama a alguien de su propia base y la ficha dice
+             "contacto no encontrado".
+
+             Se busca antes de insertar porque la tabla no tiene el
+             teléfono como clave única: un "insertar o actualizar"
+             crearía un contacto repetido en cada carga. */
+          const extra = Object.keys(r.datos).length
+            ? Object.entries(r.datos).map(([k, v]) => `${k}: ${v}`).join(' · ')
+            : null;
+
+          const yaEsta = await bd.una(
+            'SELECT id FROM contacto WHERE telefono = ? LIMIT 1', [r.telefono_1]);
+
+          if (yaEsta) {
+            /* Se completa lo que falte, sin pisar lo que ya había: el
+               dato viejo puede estar más curado que el del archivo. */
+            await bd.consultar(
+              `UPDATE contacto
+                  SET nombre       = COALESCE(nombre, ?),
+                      documento    = COALESCE(documento, ?),
+                      telefono_alt = COALESCE(telefono_alt, ?),
+                      correo       = COALESCE(correo, ?),
+                      descripcion  = COALESCE(descripcion, ?)
+                WHERE id = ?`,
+              [r.nombre || null, r.documento || null, r.telefono_2 || null,
+               r.correo || null, extra, yaEsta.id]);
+          } else {
+            await bd.consultar(
+              `INSERT INTO contacto (nombre, tipo_documento, documento, telefono,
+                                     telefono_alt, correo, campana_id, descripcion)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [r.nombre || 'Sin nombre', r.documento ? 'CC' : null, r.documento || null,
+               r.telefono_1, r.telefono_2 || null, r.correo || null,
+               b.campana_id, extra]);
+          }
         } catch { /* una fila mala no detiene las demás */ }
       }
 
@@ -809,8 +854,6 @@ router.get('/cola/mias', auth.exigirSesion, async (req, res, next) => {
       'SELECT queue_name FROM queue_members WHERE interface = ?',
       ['PJSIP/' + yo.extension]);
 
-    if (!mias.length) return res.json({ hay: false, motivo: 'No estás en ninguna cola' });
-
     const nombres = new Set(mias.map((m) => m.queue_name));
 
     /* Quién está esperando ahora mismo. QueueStatus devuelve un evento
@@ -829,8 +872,62 @@ router.get('/cola/mias', auth.exigirSesion, async (req, res, next) => {
       }))
       .sort((a, b) => a.posicion - b.posicion);
 
+    /* ── Si no hay nadie esperando en colas ──
+
+       En una campaña saliente no existen colas: las llamadas las crea
+       el motor. Entonces se muestran los próximos contactos de la base
+       activa, que es lo que el agente quiere saber: qué viene ahora y
+       cuánto falta.
+
+       Siguen siendo informativos: no se puede adelantar ni elegir. */
+    if (!llamadas.length) {
+      const yoCampana = await bd.una(
+        'SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
+
+      if (yoCampana?.campana_id) {
+        const base = await bd.una(
+          `SELECT id, nombre FROM base
+            WHERE campana_id = ? AND estado = 'activa'
+            ORDER BY creado LIMIT 1`, [yoCampana.campana_id]);
+
+        if (base) {
+          const quedan = await bd.una(
+            `SELECT COUNT(*) AS n FROM base_contacto
+              WHERE base_id = ? AND estado IN ('pendiente','agendado')`, [base.id]);
+
+          const proximos = await bd.consultar(
+            `SELECT telefono_1, telefono_2, nombre, intentos, agendado_para
+               FROM base_contacto
+              WHERE base_id = ? AND estado IN ('pendiente','agendado')
+              ORDER BY (agendado_para IS NOT NULL) DESC, agendado_para ASC, id ASC
+              LIMIT 10`, [base.id]);
+
+          return res.json({
+            hay: true,
+            origen: 'base',
+            base: base.nombre,
+            total: Number(quedan.n) || 0,
+            llamadas: proximos.map((c, i) => ({
+              cola: base.nombre,
+              posicion: i + 1,
+              numero: c.telefono_1,
+              nombre: c.nombre || null,
+              esperando: 0,
+              intentos: c.intentos || 0,
+              agendado: c.agendado_para || null,
+            })),
+          });
+        }
+      }
+
+      if (!nombres.size) {
+        return res.json({ hay: false, motivo: 'No hay base activa ni colas asignadas' });
+      }
+    }
+
     res.json({
       hay: true,
+      origen: 'cola',
       colas: [...nombres],
       total: llamadas.length,
       llamadas: llamadas.slice(0, 20),

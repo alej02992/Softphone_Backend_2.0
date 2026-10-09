@@ -73,6 +73,26 @@ router.post('/llamadas', auth.exigirSesion, async (req, res, next) => {
        segundos, tipId, resultado, (b.observaciones || '').slice(0, 2000) || null,
        req.usuario.id, yo?.extension || null]);
 
+    /* ── Cerrar el contacto de la base ──
+
+       Si la llamada venía de una base de marcación, el agente acaba de
+       tipificarla aquí. Sin esto, el contacto se quedaría asignado a su
+       nombre y el motor dejaría de mandarle llamadas: era la causa de
+       que la marcación se detuviera después de dos. */
+    if (resultado) {
+      try {
+        await bd.consultar(
+          `UPDATE base_contacto
+              SET estado = 'gestionado', gestionado_en = NOW(),
+                  resultado = ?, observaciones = COALESCE(observaciones, ?),
+                  intentos = intentos + 1, ultimo_intento = NOW()
+            WHERE agente_id = ? AND estado = 'asignado'
+              AND (telefono_1 = ? OR telefono_2 = ?)`,
+          [resultado, (b.observaciones || '').slice(0, 2000) || null,
+           req.usuario.id, numero, numero]);
+      } catch { /* si no venía de una base, no hay nada que cerrar */ }
+    }
+
     res.status(201).json({ ok: true, id: r.insertId || null, llamada: id });
   } catch (e) { next(e); }
 });
