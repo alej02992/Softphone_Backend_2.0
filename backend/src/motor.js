@@ -438,6 +438,26 @@ async function pausarAgente(usuarioId) {
 function arrancar() {
   if (reloj) return;
 
+  /* ── Canales muertos ──
+     Cuando una llamada se corta mal, Asterisk puede quedarse con un
+     canal abierto. Ese canal no tiene pareja al otro lado, pero la
+     central sigue diciendo que la extensión está ocupada, así que el
+     agente deja de recibir llamadas y nadie se entera.
+
+     Aquí se cuelgan. No se mira cuánto duran —una conversación puede
+     durar media hora— sino si tienen a alguien al otro lado. */
+  ami.on('canales-sueltos', async (sueltos) => {
+    for (const s of sueltos) {
+      try {
+        await ami.colgar(s.canal);
+        anotar(`Canal sin pareja colgado: ${s.canal} (extensión ${s.extension}, ` +
+               `${Math.round(s.segundos / 60)} min)`);
+      } catch (e) {
+        anotar(`No se pudo colgar ${s.canal}: ${e.message}`);
+      }
+    }
+  });
+
   /* Los eventos de Asterisk que interesan. OriginateResponse llega
      cuando termina el intento de llamada. */
   ami.on('evento', (e) => {
