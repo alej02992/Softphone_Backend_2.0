@@ -39,12 +39,6 @@ const CONFIG = require('./config');
 const LATIDO_MS = 30000;
 /* Cuánto se espera una respuesta antes de darla por perdida */
 const ESPERA_RESPUESTA_MS = 10000;
-/* Cuánto puede llevar un canal sin pareja antes de darlo por muerto.
-   Entre que empieza a timbrar y se empareja pasan unos segundos; dos
-   minutos es margen de sobra sin castigar una llamada que está
-   estableciéndose. */
-const MARGEN_SIN_PUENTE = 120;
-
 /* Esperas de reconexión, en segundos. Crecen para no castigar a un
    Asterisk que está reiniciando. */
 const ESPERAS = [1, 2, 5, 10, 20, 30, 60];
@@ -318,75 +312,20 @@ class Ami extends EventEmitter {
     });
   }
 
-  /**
-   * Extensiones que están ahora mismo en una CONVERSACIÓN.
-   *
-   * Se le pregunta a la central, no al navegador: así da igual si el
-   * agente marcó desde la plataforma o desde otro teléfono.
-   *
-   * CÓMO SE DISTINGUE UNA LLAMADA DE UN CANAL MUERTO
-   * Una llamada real tiene DOS canales emparejados —el del agente y el
-   * del otro lado— y los dos comparten el mismo identificador de
-   * puente. Un canal que quedó colgado tras un corte se queda solo, sin
-   * pareja.
-   *
-   * Por eso no se mira cuánto dura: una conversación puede durar veinte
-   * minutos y es perfectamente normal. Se mira si tiene a alguien al
-   * otro lado.
-   *
-   * La excepción son los canales recién creados: entre que empieza a
-   * timbrar y se empareja pasan unos segundos, y en ese rato tampoco
-   * tienen puente. Por eso se les da margen.
-   */
+  /** Extensiones que están ahora mismo en una llamada.
+      Se le pregunta a la central, no al navegador: así da igual si el
+      agente marcó desde la plataforma o desde otro teléfono. */
   async extensionesEnLlamada() {
     const canales = await this.listar(
       { Action: 'CoreShowChannels' }, 'CoreShowChannel', 'CoreShowChannelsComplete');
 
     const ocupadas = new Set();
-    const sueltos = [];
-
     canales.forEach((c) => {
       /* Los canales se llaman PJSIP/1011-00000042 */
       const m = /^PJSIP\/(\w+)-/.exec(c.Channel || '');
-      if (!m) return;
-
-      const extension = m[1];
-      const puente = String(c.BridgeId || c.BridgeID || '').trim();
-      const segundos = Number(c.Duration || 0);
-
-      if (puente) {                       // conversación de verdad
-        ocupadas.add(extension);
-        return;
-      }
-
-      if (segundos < MARGEN_SIN_PUENTE) { // todavía timbrando
-        ocupadas.add(extension);
-        return;
-      }
-
-      /* Sin pareja y con tiempo de sobra: es un canal muerto */
-      sueltos.push({ canal: c.Channel, extension, segundos });
+      if (m) ocupadas.add(m[1]);
     });
-
-    if (sueltos.length) this.emit('canales-sueltos', sueltos);
-
     return ocupadas;
-  }
-
-  /** Cuelga los canales de una extensión. Para liberar a un agente que
-      quedó trancado, sin tocar las llamadas de los demás. */
-  async colgarDe(extension) {
-    const canales = await this.listar(
-      { Action: 'CoreShowChannels' }, 'CoreShowChannel', 'CoreShowChannelsComplete');
-
-    const suyos = canales
-      .map((c) => c.Channel)
-      .filter((ch) => new RegExp(`^PJSIP/${extension}-`).test(ch || ''));
-
-    for (const canal of suyos) {
-      try { await this.colgar(canal); } catch { /* ya no existía */ }
-    }
-    return suyos.length;
   }
 
   /** Cuelga un canal. */
