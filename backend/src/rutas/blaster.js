@@ -163,7 +163,13 @@ function revisarConfiguracion(b) {
   }
 
   if (b.respuesta) {
-    if (!b.respuesta_guion || String(b.respuesta_guion).trim().length < 5) {
+    /* La pregunta escrita solo hace falta con voz sintética: se añade al
+       final del mensaje. Con audio grabado, la pregunta va dentro de la
+       propia grabación, y la pantalla ni siquiera muestra el campo.
+       Antes se exigía siempre, y un blaster de audio grabado con
+       respuesta no se podía guardar. */
+    if (b.tipo !== 'audio' &&
+        (!b.respuesta_guion || String(b.respuesta_guion).trim().length < 5)) {
       return 'Falta lo que se le dice al cliente para pedirle la respuesta';
     }
     if (b.respuesta_tipo === 'tecla') {
@@ -197,7 +203,8 @@ router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.tipo || 'texto',
        b.guion || null, b.audio_archivo || null, b.voz_id || null,
-       !!b.respuesta, b.respuesta_tipo || 'tecla', b.respuesta_guion || null,
+       !!b.respuesta, b.respuesta_tipo || 'tecla',
+       b.tipo === 'audio' ? null : (b.respuesta_guion || null),
        b.respuesta_opciones || null, b.respuesta_digitos || 10,
        b.hora_inicio || '08:00:00', b.hora_fin || '18:00:00',
        b.dias || 'L,M,X,J,V', b.reintentos ?? 2, req.usuario.id]);
@@ -237,7 +244,8 @@ router.put('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async (re
               estado = 'borrador'
         WHERE id = ?`,
       [String(b.nombre).trim(), b.tipo, b.guion || null, b.audio_archivo || null, b.voz_id || null,
-       !!b.respuesta, b.respuesta_tipo || 'tecla', b.respuesta_guion || null,
+       !!b.respuesta, b.respuesta_tipo || 'tecla',
+       b.tipo === 'audio' ? null : (b.respuesta_guion || null),
        b.respuesta_opciones || null, b.respuesta_digitos || 10,
        b.hora_inicio, b.hora_fin, b.dias, b.reintentos, id]);
 
