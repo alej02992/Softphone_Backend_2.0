@@ -186,4 +186,29 @@ async function generar(texto, vozId, base = 'blaster') {
   return { archivo, bytes: r.audio.length };
 }
 
-module.exports = { generar, disponible, proveedor, armarNombre: nombreDe, CARPETA };
+/**
+ * El audio en un formato que el navegador sepa reproducir, para que el
+ * supervisor lo escuche antes de lanzar el blaster.
+ *
+ * Los audios se guardan en formato telefónico —μ-law a 8 kHz—, que es
+ * lo que reproduce Asterisk, pero un navegador no lo entiende. Aquí se
+ * convierte a wav al vuelo, sin guardar nada: solo se usa para oírlo.
+ */
+function paraEscuchar(archivo) {
+  const { execFile } = require('child_process');
+  const ruta = path.isAbsolute(archivo) ? archivo : path.join(CARPETA, archivo);
+
+  return new Promise((resolver) => {
+    const esUlaw = /\.ulaw$/i.test(ruta);
+    const args = esUlaw
+      ? ['-f', 'mulaw', '-ar', '8000', '-ac', '1', '-i', ruta, '-f', 'wav', 'pipe:1']
+      : ['-i', ruta, '-f', 'wav', 'pipe:1'];
+
+    execFile('ffmpeg', ['-v', 'error', ...args],
+      { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 15000 },
+      (err, salida) => resolver(err || !salida?.length ? null : salida.toString('base64')));
+  });
+}
+
+module.exports = {
+  paraEscuchar, generar, disponible, proveedor, armarNombre: nombreDe, CARPETA };

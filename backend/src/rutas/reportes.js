@@ -389,6 +389,143 @@ router.get('/reportes/formularios/:id', auth.exigirSesion, auth.exigir('reportes
     } catch (e) { next(e); }
   });
 
+/* ═══════════ REPORTE DEL BLASTER ═══════════
+
+   El resultado completo de un blaster: a quién se llamó, quién
+   contestó y qué respondió.
+
+   No se filtra por fecha. Un blaster ya es una campaña acotada; si se
+   filtrara por hoy, al revisar el de ayer saldría vacío y parecería que
+   no llamó a nadie.                                                   */
+
+/** Los blasters que este supervisor puede consultar. */
+router.get('/reportes/blasters', auth.exigirSesion, auth.exigir('reportes'),
+  async (req, res, next) => {
+    try {
+      const mias = await campanasDe(req.usuario);
+      let sql = `SELECT b.id, b.nombre, b.estado, b.respuesta, c.nombre AS campana,
+                        (SELECT COUNT(*) FROM blaster_destinatario d
+                          WHERE d.blaster_id = b.id) AS destinatarios
+                   FROM blaster b LEFT JOIN campana c ON c.id = b.campana_id`;
+      const val = [];
+
+      if (mias !== null) {
+        if (!mias.length) return res.json([]);
+        sql += ` WHERE b.campana_id IN (${mias.map(() => '?').join(',')})`;
+        val.push(...mias);
+      }
+      sql += ' ORDER BY b.creado DESC';
+
+      res.json(await bd.consultar(sql, val));
+    } catch (e) { next(e); }
+  });
+
+/** Cómo se dice cada estado, para que el reporte se lea sin traducir. */
+const ESTADO_DESTINO = {
+  pendiente: 'Pendiente',
+  llamando: 'Llamando',
+  contestada: 'Contestó',
+  sin_respuesta: 'No contestó',
+  buzon: 'Buzón de voz',
+  fallida: 'Falló',
+  excluido: 'Excluido',
+};
+
+router.get('/reportes/blasters/:id', auth.exigirSesion, auth.exigir('reportes'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const b = await bd.una(
+        `SELECT b.id, b.nombre, b.campana_id, b.respuesta, b.respuesta_tipo,
+                b.respuesta_opciones, b.respuesta_etiquetas, c.nombre AS campana
+           FROM blaster b LEFT JOIN campana c ON c.id = b.campana_id
+          WHERE b.id = ?`, [id]);
+      if (!b) return res.status(404).json({ error: 'Ese blaster no existe' });
+
+      const mias = await campanasDe(req.usuario);
+      if (mias !== null && !mias.includes(b.campana_id)) {
+        return res.status(403).json({ error: 'Ese blaster no es de tus campañas' });
+      }
+
+      /* Cada destinatario con su última respuesta, si dio alguna. Si
+         marcó dos veces se muestra la última: es la que vale. */
+      const filas = await bd.consultar(
+        `SELECT d.id, d.numero, d.nombre, d.estado, d.intentos, d.ultimo_intento,
+                (SELECT r.valor FROM blaster_respuesta r
+                  WHERE r.destinatario_id = d.id ORDER BY r.id DESC LIMIT 1) AS respuesta,
+                (SELECT r.creada FROM blaster_respuesta r
+                  WHERE r.destinatario_id = d.id ORDER BY r.id DESC LIMIT 1) AS respondio_en
+           FROM blaster_destinatario d
+          WHERE d.blaster_id = ?
+          ORDER BY d.id`, [id]);
+
+      const llamados = filas.filter((f) => (f.intentos || 0) > 0 ||
+        !['pendiente', 'excluido'].includes(f.estado)).length;
+      const contestaron = filas.filter((f) => f.estado === 'contestada').length;
+      const respondieron = filas.filter((f) => f.respuesta && !/^invalida:/.test(f.respuesta)).length;
+
+      /* Qué significa cada tecla. Con esto el reporte dice "Quiere que
+         lo llamen" en vez de "Marcó 1": se entiende sin tener que
+         acordarse de cómo era el mensaje. */
+      let etiquetas = {};
+      try { etiquetas = b.respuesta_etiquetas ? JSON.parse(b.respuesta_etiquetas) : {}; }
+      catch { etiquetas = {}; }
+
+      const esNumero = b.respuesta_tipo === 'numero';
+      const nombreDe = (valor) => etiquetas[valor]
+        ? `${valor} · ${etiquetas[valor]}`
+        : (esNumero ? valor : `Marcó ${valor}`);
+
+      /* El reparto solo tiene sentido con teclas. Si se pidió digitar un
+         número —un documento, por ejemplo—, cada respuesta es distinta:
+         el "reparto" sería una lista de cien valores con uno cada uno. */
+      const cuenta = new Map();
+      if (!esNumero) {
+        filas.forEach((f) => {
+          if (!f.respuesta || /^invalida:/.test(f.respuesta)) return;
+          cuenta.set(f.respuesta, (cuenta.get(f.respuesta) || 0) + 1);
+        });
+      }
+      const reparto = [...cuenta.entries()]
+        .map(([valor, n]) => ({
+          valor: nombreDe(valor), cantidad: n,
+          porcentaje: respondieron ? Math.round((n / respondieron) * 1000) / 10 : 0,
+        }))
+        .sort((a, z) => z.cantidad - a.cantidad);
+
+      res.json({
+        blaster: b.nombre,
+        pideRespuesta: !!b.respuesta,
+        resumen: {
+          destinatarios: filas.length,
+          llamados,
+          contestaron,
+          respondieron,
+          pendientes: filas.filter((f) => f.estado === 'pendiente').length,
+          /* Qué porcentaje de los que contestaron llegó a responder */
+          tasaRespuesta: contestaron ? Math.round((respondieron / contestaron) * 1000) / 10 : 0,
+        },
+        tipoRespuesta: b.respuesta ? b.respuesta_tipo : null,
+        reparto: b.respuesta && reparto.length
+          ? [{ etiqueta: 'Respuestas', total: respondieron, opciones: reparto }]
+          : [],
+        destinatarios: filas.map((f) => ({
+          numero: f.numero,
+          nombre: f.nombre || '—',
+          estado: ESTADO_DESTINO[f.estado] || f.estado,
+          intentos: f.intentos || 0,
+          ultimaLlamada: f.ultimo_intento
+            ? `${fecha(f.ultimo_intento)} ${hora(f.ultimo_intento).slice(0, 5)}` : '—',
+          respuesta: !f.respuesta ? '—'
+            : /^invalida:/.test(f.respuesta) ? `Inválida (${f.respuesta.split(':')[1]})`
+            : nombreDe(f.respuesta),
+          respondio: f.respondio_en
+            ? `${fecha(f.respondio_en)} ${hora(f.respondio_en).slice(0, 5)}` : '—',
+        })),
+      });
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ INDICADORES DEL DÍA ═══════════
 
    Lo que un supervisor necesita saber de un vistazo: cómo va el día.
@@ -491,6 +628,11 @@ const COLUMNAS = {
     ['direccion', 'Dirección'], ['duracion', 'Duración'],
     ['resultado', 'Resultado'], ['observaciones', 'Observaciones'],
   ],
+  blaster: [
+    ['numero', 'Número'], ['nombre', 'Nombre'], ['estado', 'Estado'],
+    ['intentos', 'Intentos'], ['ultimaLlamada', 'Última llamada'],
+    ['respuesta', 'Respuesta'], ['respondio', 'Respondió el'],
+  ],
   sesiones: [
     ['fecha', 'Fecha'], ['agente', 'Agente'], ['extension', 'Ext.'],
     ['campana', 'Campaña'], ['entrada', 'Entrada'], ['salida', 'Salida'],
@@ -504,6 +646,7 @@ const TITULOS = {
   tipificaciones: 'Reporte de tipificación',
   sesiones: 'Reporte de inicio de sesión',
   formularios: 'Reporte de formularios',
+  blaster: 'Reporte de blaster',
 };
 
 router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
@@ -513,6 +656,17 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
       const formato = String(req.body.formato || 'csv');
       const filas = Array.isArray(req.body.filas) ? req.body.filas : [];
       const periodo = String(req.body.periodo || '');
+
+      /* El subtítulo: por defecto el periodo consultado. El reporte de
+         blaster no filtra por fechas, así que manda el nombre del
+         blaster en su lugar. */
+      const subtitulo = String(req.body.subtitulo || periodo || 'Sin periodo').slice(0, 120);
+
+      /* El resumen que se ve arriba en la pantalla: los indicadores y el
+         reparto. Antes el PDF solo traía la tabla, y quien lo recibía
+         tenía que contar a mano lo que la pantalla ya calculaba. */
+      const resumen = Array.isArray(req.body.resumen) ? req.body.resumen.slice(0, 6) : [];
+      const reparto = Array.isArray(req.body.reparto) ? req.body.reparto.slice(0, 3) : [];
 
       /* El reporte de formularios trae sus propias columnas, porque
          cada formulario tiene las suyas. Los demás las tienen fijas. */
@@ -621,6 +775,64 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
         let hayLogo = false;
         try { hayLogo = !!rutaLogo && fs.existsSync(rutaLogo); } catch { hayLogo = false; }
 
+        /**
+         * Dibuja el resumen debajo del título: los indicadores en tarjetas
+         * y el reparto en barras. Devuelve dónde termina.
+         */
+        const dibujarResumen = (y0) => {
+          let y = y0;
+          const ancho = doc.page.width - 60;
+
+          if (resumen.length) {
+            const n = resumen.length;
+            const sep = 8;
+            const w = (ancho - sep * (n - 1)) / n;
+            resumen.forEach((t, i) => {
+              const [etq, valor, sub] = Array.isArray(t) ? t : [t.etiqueta, t.valor, t.sub];
+              const x = 30 + i * (w + sep);
+              doc.roundedRect(x, y, w, 40, 4).fillColor('#F4F7F9').fill();
+              doc.fontSize(6.8).fillColor('#5A6670').text(String(etq || '').toUpperCase(), x + 7, y + 6,
+                { width: w - 14, ellipsis: true });
+              doc.fontSize(13).fillColor('#002E44').text(String(valor ?? ''), x + 7, y + 15,
+                { width: w - 14, ellipsis: true });
+              doc.fontSize(6.5).fillColor('#8B979F').text(String(sub || ''), x + 7, y + 31,
+                { width: w - 14, ellipsis: true });
+            });
+            y += 48;
+          }
+
+          reparto.forEach((grupo) => {
+            const opciones = (grupo.opciones || []).slice(0, 8);
+            if (!opciones.length) return;
+
+            doc.fontSize(8).fillColor('#002E44')
+               .text(`${grupo.etiqueta || 'Resultados'} · ${grupo.total ?? ''} respuestas`, 30, y);
+            y += 13;
+
+            const anchoNombre = 170, anchoBarra = ancho - anchoNombre - 90;
+            opciones.forEach((o) => {
+              const pct = Math.max(0, Math.min(100, Number(o.porcentaje) || 0));
+              doc.fontSize(7.5).fillColor('#1b1f24')
+                 .text(String(o.valor ?? o.resultado ?? ''), 30, y + 1, { width: anchoNombre - 8, ellipsis: true });
+              doc.roundedRect(30 + anchoNombre, y + 2, anchoBarra, 7, 3).fillColor('#E8EDF0').fill();
+              if (pct > 0) {
+                doc.roundedRect(30 + anchoNombre, y + 2, Math.max(4, anchoBarra * pct / 100), 7, 3)
+                   .fillColor('#00A0D6').fill();
+              }
+              doc.fontSize(7.5).fillColor('#5A6670')
+                 .text(`${o.cantidad ?? ''}  ·  ${pct}%`, 30 + anchoNombre + anchoBarra + 8, y + 1,
+                   { width: 80, align: 'right' });
+              y += 12;
+            });
+            y += 6;
+          });
+
+          return y;
+        };
+
+        /* El resumen va solo en la primera página */
+        let primeraPagina = true;
+
         const cabecera = () => {
           let x = 30;
 
@@ -633,16 +845,31 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
 
           doc.fontSize(13).fillColor('#002E44').text(titulo, x, 25);
           doc.fontSize(8).fillColor('#666')
-             .text(`BPM Consulting · ${periodo || 'Sin periodo'} · ${filas.length} registros`, x, 43);
+             .text(`BPM Consulting · ${subtitulo} · ${filas.length} registros`, x, 43);
 
           /* Fecha de generación: un reporte impreso sin fecha no sirve
              de nada dos semanas después. */
+          /* La fecha se arma a mano: cortar el texto de toLocaleString
+             dejaba la hora a medias —"20:3" en vez de "20:37"—. */
+          const ahora = new Date();
+          const dos = (n) => String(n).padStart(2, '0');
+          const generado = `${dos(ahora.getDate())}/${dos(ahora.getMonth() + 1)}/${ahora.getFullYear()} ` +
+                           `${dos(ahora.getHours())}:${dos(ahora.getMinutes())}`;
           doc.fontSize(7.5).fillColor('#8B979F')
-             .text(`Generado el ${new Date().toLocaleString('es-CO', { hour12: false }).slice(0, 16)}`,
+             .text(`Generado el ${generado}`,
                    doc.page.width - 230, 27, { width: 200, align: 'right' });
 
           doc.moveTo(30, 58).lineTo(doc.page.width - 30, 58)
              .strokeColor('#00BFFC').lineWidth(1.5).stroke();
+
+          let yCols = 64;
+          if (primeraPagina && (resumen.length || reparto.length)) {
+            yCols = dibujarResumen(66) + 4;
+            doc.moveTo(30, yCols - 2).lineTo(doc.page.width - 30, yCols - 2)
+               .strokeColor('#DDE3E8').lineWidth(0.5).stroke();
+            yCols += 4;
+          }
+          primeraPagina = false;
 
           let cx = 30;
           doc.fontSize(tituloPt).fillColor('#002E44');
@@ -654,16 +881,16 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
             const texto = String(etiqueta);
             const h = doc.heightOfString(texto, { width: anchos[i] - 4 });
             altoCabecera = Math.max(altoCabecera, Math.min(h, tituloPt * 2.6));
-            doc.text(texto, cx + 2, 64, {
+            doc.text(texto, cx + 2, yCols, {
               width: anchos[i] - 4, height: tituloPt * 2.6, ellipsis: true,
             });
             cx += anchos[i];
           });
 
-          doc.moveTo(30, 66 + altoCabecera).lineTo(doc.page.width - 30, 66 + altoCabecera)
+          doc.moveTo(30, yCols + 2 + altoCabecera).lineTo(doc.page.width - 30, yCols + 2 + altoCabecera)
              .strokeColor('#DDE3E8').lineWidth(0.5).stroke();
 
-          return 70 + altoCabecera;
+          return yCols + 6 + altoCabecera;
         };
 
         let y = cabecera();

@@ -39,6 +39,31 @@ function conPregunta(b, texto) {
   return b.respuesta && pregunta ? `${texto} ${pregunta}` : texto;
 }
 
+/**
+ * Qué significa cada tecla, limpio y listo para guardar.
+ *
+ * Solo se guardan las de las teclas que se ofrecen: si alguien marca la
+ * 3 y después la desmarca, su etiqueta no debe quedar colgada. Y cada
+ * una se recorta, porque es texto libre que acaba en un reporte.
+ */
+function etiquetasLimpias(b) {
+  if (!b.respuesta || b.respuesta_tipo !== 'tecla') return null;
+
+  let crudo = b.respuesta_etiquetas;
+  if (typeof crudo === 'string') {
+    try { crudo = JSON.parse(crudo); } catch { crudo = {}; }
+  }
+  if (!crudo || typeof crudo !== 'object') return null;
+
+  const ofrecidas = String(b.respuesta_opciones || '').split(',').map((t) => t.trim());
+  const limpio = {};
+  for (const tecla of ofrecidas) {
+    const texto = String(crudo[tecla] || '').trim().slice(0, 60);
+    if (texto) limpio[tecla] = texto;
+  }
+  return Object.keys(limpio).length ? JSON.stringify(limpio) : null;
+}
+
 /* ═══════════ A QUÉ CAMPAÑAS ALCANZA CADA QUIEN ═══════════
    El administrador, a todas. El supervisor, solo a las suyas. */
 async function campanasDe(usuario) {
@@ -198,14 +223,15 @@ router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, 
     const [r] = await bd.pool.execute(
       `INSERT INTO blaster
          (nombre, campana_id, tipo, guion, audio_archivo, voz_id,
-          respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones, respuesta_digitos,
+          respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
+          respuesta_etiquetas, respuesta_digitos,
           hora_inicio, hora_fin, dias, reintentos, creado_por)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.tipo || 'texto',
        b.guion || null, b.audio_archivo || null, b.voz_id || null,
        !!b.respuesta, b.respuesta_tipo || 'tecla',
        b.tipo === 'audio' ? null : (b.respuesta_guion || null),
-       b.respuesta_opciones || null, b.respuesta_digitos || 10,
+       b.respuesta_opciones || null, etiquetasLimpias(b), b.respuesta_digitos || 10,
        b.hora_inicio || '08:00:00', b.hora_fin || '18:00:00',
        b.dias || 'L,M,X,J,V', b.reintentos ?? 2, req.usuario.id]);
 
@@ -239,14 +265,14 @@ router.put('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async (re
     await bd.consultar(
       `UPDATE blaster SET nombre = ?, tipo = ?, guion = ?, audio_archivo = ?, voz_id = ?,
               respuesta = ?, respuesta_tipo = ?, respuesta_guion = ?,
-              respuesta_opciones = ?, respuesta_digitos = ?,
+              respuesta_opciones = ?, respuesta_etiquetas = ?, respuesta_digitos = ?,
               hora_inicio = ?, hora_fin = ?, dias = ?, reintentos = ?,
               estado = 'borrador'
         WHERE id = ?`,
       [String(b.nombre).trim(), b.tipo, b.guion || null, b.audio_archivo || null, b.voz_id || null,
        !!b.respuesta, b.respuesta_tipo || 'tecla',
        b.tipo === 'audio' ? null : (b.respuesta_guion || null),
-       b.respuesta_opciones || null, b.respuesta_digitos || 10,
+       b.respuesta_opciones || null, etiquetasLimpias(b), b.respuesta_digitos || 10,
        b.hora_inicio, b.hora_fin, b.dias, b.reintentos, id]);
 
     await auth.auditar(req.usuario.id, 'modificar', 'blaster', id,
@@ -445,7 +471,13 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
         const { texto: base } = armarTexto(b.guion, datos);
         const texto = conPregunta(b, base);
         const r = await voz.generar(texto, b.voz_id, `blaster-${id}-muestra`);
-        return res.json({ muestra: true, texto, archivo: r.archivo, error: r.error });
+        if (r.error) return res.status(502).json({ error: r.error });
+
+        /* El audio para escucharlo en la pantalla. Se guarda en formato
+           telefónico, que el navegador no reproduce: se convierte solo
+           para oírlo. */
+        return res.json({ muestra: true, texto, archivo: r.archivo,
+                          escuchar: await voz.paraEscuchar(r.archivo) });
       }
 
       if (b.tipo === 'texto') {
@@ -453,7 +485,8 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
         if (r.error) return res.status(502).json({ error: r.error });
 
         await bd.consultar('UPDATE blaster SET audio_archivo = ? WHERE id = ?', [r.archivo, id]);
-        return res.json({ generados: 1, archivo: r.archivo });
+        return res.json({ generados: 1, archivo: r.archivo, texto: conPregunta(b, b.guion),
+                          escuchar: await voz.paraEscuchar(r.archivo) });
       }
 
       /* Con variables: uno por persona */
@@ -633,5 +666,146 @@ router.post('/blasters/:id/respuestas', auth.exigirSesion, async (req, res, next
     para saber por qué un blaster no está llamando. */
 router.get('/blaster/motor', auth.exigirSesion, auth.exigir('blaster'),
   (req, res) => res.json(require('../blaster-motor').estado()));
+
+/* ═══════════ DEL BLASTER A UNA BASE DE MARCACIÓN ═══════════
+
+   El blaster deja de ser solo un aviso y se vuelve la primera parte de
+   una gestión: los que marcaron "1 · Quiere que lo llamen" pasan a una
+   base de marcación, y un agente los llama.
+
+   Se puede pasar cualquier grupo: los que marcaron una tecla, los que
+   contestaron sin marcar, o los que no contestaron —para intentarlo
+   con una persona en vez de una grabación—.                           */
+
+/** Los grupos que se pueden pasar, con cuántos tiene cada uno. */
+async function gruposDe(b) {
+  let etiquetas = {};
+  try { etiquetas = b.respuesta_etiquetas ? JSON.parse(b.respuesta_etiquetas) : {}; }
+  catch { etiquetas = {}; }
+
+  /* La última respuesta de cada persona: si marcó dos veces, vale la
+     última. */
+  const filas = await bd.consultar(
+    `SELECT d.id, d.estado,
+            (SELECT r.valor FROM blaster_respuesta r
+              WHERE r.destinatario_id = d.id ORDER BY r.id DESC LIMIT 1) AS valor
+       FROM blaster_destinatario d WHERE d.blaster_id = ?`, [b.id]);
+
+  const grupos = new Map();
+  const sumar = (clave, nombre, id) => {
+    if (!grupos.has(clave)) grupos.set(clave, { clave, nombre, ids: [] });
+    grupos.get(clave).ids.push(id);
+  };
+
+  filas.forEach((f) => {
+    const valido = f.valor && !/^invalida:/.test(f.valor);
+
+    if (valido && b.respuesta_tipo === 'tecla') {
+      sumar(`tecla:${f.valor}`,
+        etiquetas[f.valor] ? `Marcaron ${f.valor} · ${etiquetas[f.valor]}` : `Marcaron ${f.valor}`, f.id);
+    } else if (valido) {
+      sumar('respondio', 'Respondieron', f.id);
+    } else if (f.estado === 'contestada') {
+      sumar('sin_tecla', 'Contestaron pero no marcaron', f.id);
+    } else if (['sin_respuesta', 'fallida', 'buzon'].includes(f.estado)) {
+      sumar('no_contesto', 'No contestaron', f.id);
+    }
+  });
+
+  return [...grupos.values()];
+}
+
+router.get('/blasters/:id/grupos', auth.exigirSesion, auth.exigir('blaster'),
+  async (req, res, next) => {
+    try {
+      const b = await bd.una('SELECT * FROM blaster WHERE id = ?', [Number(req.params.id)]);
+      if (!b) return res.status(404).json({ error: 'El blaster no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const grupos = await gruposDe(b);
+      res.json(grupos.map(({ clave, nombre, ids }) => ({ clave, nombre, cantidad: ids.length })));
+    } catch (e) { next(e); }
+  });
+
+router.post('/blasters/:id/a-base', auth.exigirSesion, auth.exigir('blaster'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const b = await bd.una('SELECT * FROM blaster WHERE id = ?', [id]);
+      if (!b) return res.status(404).json({ error: 'El blaster no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const grupos = await gruposDe(b);
+      const grupo = grupos.find((g) => g.clave === String(req.body.grupo || ''));
+      if (!grupo || !grupo.ids.length) {
+        return res.status(400).json({ error: 'Ese grupo no tiene a nadie' });
+      }
+
+      const nombre = String(req.body.nombre || '').trim() || `${b.nombre} · ${grupo.nombre}`;
+      if (nombre.length < 3) return res.status(400).json({ error: 'La base necesita un nombre' });
+
+      const personas = await bd.consultar(
+        `SELECT d.id, d.numero, d.nombre, d.datos,
+                (SELECT r.valor FROM blaster_respuesta r
+                  WHERE r.destinatario_id = d.id ORDER BY r.id DESC LIMIT 1) AS valor
+           FROM blaster_destinatario d
+          WHERE d.id IN (${grupo.ids.map(() => '?').join(',')})`, grupo.ids);
+
+      /* Los de la lista de no llamar no pasan, aunque estén en el grupo:
+         pidieron que no se les contactara. */
+      const excluidos = new Set((await bd.consultar(
+        `SELECT numero FROM no_llamar WHERE numero IN (${personas.map(() => '?').join(',')})`,
+        personas.map((p) => p.numero))).map((x) => x.numero));
+
+      let etiquetas = {};
+      try { etiquetas = b.respuesta_etiquetas ? JSON.parse(b.respuesta_etiquetas) : {}; }
+      catch { etiquetas = {}; }
+
+      let baseId = 0;
+      let cargados = 0;
+
+      await bd.transaccion(async (cx) => {
+        /* La base nace en borrador: el supervisor la revisa, ajusta el
+           horario si hace falta y la activa él. */
+        const [nueva] = await cx.execute(
+          `INSERT INTO base (nombre, campana_id, reintentos, intervalo_min,
+                             hora_inicio, hora_fin, dias, estado, creado_por)
+           VALUES (?, ?, 2, 60, '08:00:00', '18:00:00', 'L,M,X,J,V', 'borrador', ?)`,
+          [nombre.slice(0, 120), b.campana_id, req.usuario.id]);
+        baseId = nueva.insertId;
+
+        for (const p of personas) {
+          if (excluidos.has(p.numero)) continue;
+
+          let datos = {};
+          try { datos = typeof p.datos === 'string' ? JSON.parse(p.datos || '{}') : (p.datos || {}); }
+          catch { datos = {}; }
+
+          /* El agente ve qué respondió en el blaster: llama sabiendo por
+             qué lo llama. */
+          if (p.valor && !/^invalida:/.test(p.valor)) {
+            datos['respuesta en el blaster'] = etiquetas[p.valor]
+              ? `${p.valor} · ${etiquetas[p.valor]}` : p.valor;
+          }
+          datos['viene del blaster'] = b.nombre;
+
+          await cx.execute(
+            `INSERT INTO base_contacto (base_id, telefono_1, nombre, datos)
+             VALUES (?, ?, ?, ?)`,
+            [baseId, p.numero, p.nombre || null, JSON.stringify(datos)]);
+          cargados++;
+        }
+      });
+
+      await auth.auditar(req.usuario.id, 'crear', 'base', baseId,
+        `Creó la base "${nombre}" con ${cargados} contactos del blaster "${b.nombre}"`, req.ip);
+
+      res.status(201).json({ ok: true, base_id: baseId, nombre, cargados, excluidos: excluidos.size });
+    } catch (e) { next(e); }
+  });
 
 module.exports = router;
