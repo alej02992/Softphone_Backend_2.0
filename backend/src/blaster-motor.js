@@ -66,7 +66,8 @@ async function blastersActivos() {
 
   return bd.consultar(
     `SELECT id, nombre, tipo, guion, audio_archivo, voz_id,
-            respuesta, respuesta_digitos, reintentos, intervalo_min
+            respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
+            respuesta_digitos, reintentos, intervalo_min
        FROM blaster
       WHERE estado = 'activo'
         AND aprobado = TRUE
@@ -96,7 +97,14 @@ async function enCurso() {
 async function audioPara(b, d) {
   let archivo;
 
-  if (b.tipo === 'audio') {
+  /* Primero, lo que ya se generó. La plataforma genera los audios ANTES
+     de lanzar el blaster —para que el supervisor los escuche— y aquí se
+     reutilizan. Generarlos otra vez al llamar gastaría el doble de
+     créditos del servicio de voz, que se cobra por carácter. */
+  if (d.audio_archivo) {
+    archivo = d.audio_archivo;
+
+  } else if (b.tipo === 'audio' || (b.tipo === 'texto' && b.audio_archivo)) {
     archivo = b.audio_archivo;
 
   } else {
@@ -109,6 +117,9 @@ async function audioPara(b, d) {
       datos.nombre = datos.nombre || d.nombre || '';
       texto = texto.replace(/\{(\w+)\}/g, (_, k) => String(datos[k] ?? ''));
     }
+
+    const pregunta = String(b.respuesta_guion || '').trim();
+    if (b.respuesta && pregunta) texto = `${texto} ${pregunta}`;
 
     const r = await voz.generar(texto, b.voz_id, `blaster-${b.id}`);
     if (r.error) throw new Error(r.error);
@@ -150,7 +161,10 @@ async function llamar(b, d) {
     const resp = await ami.originarBlaster({
       numero: d.numero,
       audio,
-      digitos: b.respuesta ? (b.respuesta_digitos || 1) : 0,
+      /* Si se pide respuesta, cuántas teclas escuchar: una sola para
+         "marque 1 o 2", o varias para "digite su documento". */
+      digitos: !b.respuesta ? 0
+        : b.respuesta_tipo === 'numero' ? (b.respuesta_digitos || 10) : 1,
       identificador: `blaster-${d.id}`,
       contextoSalida: CONFIG.blaster?.contextoSalida || 'from-internal',
     });
@@ -210,6 +224,39 @@ async function alResponder(e) {
   await terminarIntento(destinoId, d, contesto);
 }
 
+/* ═══════════ LA RESPUESTA DEL CLIENTE ═══════════
+
+   Cuando el cliente marca, el plan de marcación lo avisa con un evento
+   propio, "BlasterRespuesta", que trae el identificador del
+   destinatario y lo que marcó. Aquí se guarda.                        */
+
+async function alResponderCliente(e) {
+  const m = /^blaster-(\d+)$/.exec(String(e.Id || ''));
+  if (!m) return;
+
+  const valor = String(e.Valor || '').replace(/[^0-9*#]/g, '').slice(0, 40);
+  if (!valor) return;                      // no marcó nada
+
+  const d = await bd.una(
+    `SELECT d.id, d.numero, d.blaster_id, b.respuesta_tipo, b.respuesta_opciones
+       FROM blaster_destinatario d JOIN blaster b ON b.id = d.blaster_id
+      WHERE d.id = ?`, [Number(m[1])]);
+  if (!d) return;
+
+  /* Si se pedía una tecla, solo cuentan las que se ofrecieron. Una
+     tecla fuera de la lista se guarda marcada como inválida, para que
+     el reporte no la cuente como un sí o un no. */
+  const validas = String(d.respuesta_opciones || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const final = d.respuesta_tipo === 'tecla' && validas.length && !validas.includes(valor)
+    ? `invalida:${valor}` : valor;
+
+  await bd.consultar(
+    `INSERT INTO blaster_respuesta (blaster_id, destinatario_id, numero, valor)
+     VALUES (?, ?, ?, ?)`, [d.blaster_id, d.id, d.numero, final]);
+
+  anotar(`Respuesta de ${d.numero}: ${final}`);
+}
+
 /* ═══════════ LIMPIEZA ═══════════ */
 
 /** Las que quedaron "llamando" sin respuesta de la central. */
@@ -253,7 +300,7 @@ async function vuelta() {
       if (libres <= 0) break;
 
       const destinos = await bd.consultar(
-        `SELECT id, numero, nombre, datos
+        `SELECT id, numero, nombre, datos, audio_archivo
            FROM blaster_destinatario
           WHERE blaster_id = ? AND estado = 'pendiente'
             AND (proximo_intento IS NULL OR proximo_intento <= NOW())
@@ -282,6 +329,9 @@ function arrancar() {
 
   ami.on('evento', (e) => {
     if (e.Event === 'OriginateResponse') alResponder(e).catch(() => {});
+    if (e.Event === 'UserEvent' && e.UserEvent === 'BlasterRespuesta') {
+      alResponderCliente(e).catch(() => {});
+    }
   });
 
   reloj = setInterval(vuelta, CICLO_MS);

@@ -28,6 +28,17 @@ const voz = require('../voz');
 
 const router = express.Router();
 
+/** El mensaje completo que se convierte en voz: el guion y, si se pide
+    respuesta, la pregunta al final. Van en el mismo audio y con la misma
+    voz: si fueran dos audios separados se notaría el corte.
+
+    Con audio grabado no se usa: ahí la pregunta va dentro de la
+    grabación. */
+function conPregunta(b, texto) {
+  const pregunta = String(b.respuesta_guion || '').trim();
+  return b.respuesta && pregunta ? `${texto} ${pregunta}` : texto;
+}
+
 /* ═══════════ A QUÉ CAMPAÑAS ALCANZA CADA QUIEN ═══════════
    El administrador, a todas. El supervisor, solo a las suyas. */
 async function campanasDe(usuario) {
@@ -423,13 +434,14 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
         const d = await bd.una(
           'SELECT datos FROM blaster_destinatario WHERE blaster_id = ? LIMIT 1', [id]);
         const datos = d?.datos ? (typeof d.datos === 'string' ? JSON.parse(d.datos) : d.datos) : {};
-        const { texto } = armarTexto(b.guion, datos);
+        const { texto: base } = armarTexto(b.guion, datos);
+        const texto = conPregunta(b, base);
         const r = await voz.generar(texto, b.voz_id, `blaster-${id}-muestra`);
         return res.json({ muestra: true, texto, archivo: r.archivo, error: r.error });
       }
 
       if (b.tipo === 'texto') {
-        const r = await voz.generar(b.guion, b.voz_id, `blaster-${id}`);
+        const r = await voz.generar(conPregunta(b, b.guion), b.voz_id, `blaster-${id}`);
         if (r.error) return res.status(502).json({ error: r.error });
 
         await bd.consultar('UPDATE blaster SET audio_archivo = ? WHERE id = ?', [r.archivo, id]);
@@ -445,7 +457,8 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
 
       for (const d of destinos) {
         const datos = d.datos ? (typeof d.datos === 'string' ? JSON.parse(d.datos) : d.datos) : {};
-        const { texto, faltan } = armarTexto(b.guion, datos);
+        const { texto: base, faltan } = armarTexto(b.guion, datos);
+        const texto = conPregunta(b, base);
 
         if (faltan.length) { fallidos.push({ id: d.id, error: 'Faltan datos: ' + faltan.join(', ') }); continue; }
 
