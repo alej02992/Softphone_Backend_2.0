@@ -442,12 +442,25 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
 
 /* ═══════════ APROBAR, PAUSAR, REANUDAR ═══════════ */
 
-router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster_aprobar'),
+/* ═══════════ LANZAR, PAUSAR, CANCELAR ═══════════
+
+   Lo hace el supervisor, sin esperar al administrador. La operación lo
+   necesita así: quien prepara la campaña es quien sabe cuándo lanzarla.
+
+   Lo que se mantiene es el alcance: un supervisor solo lanza los
+   blasters de SUS campañas. Antes esto lo hacía solo el administrador
+   y no hacía falta comprobarlo; ahora sí. */
+router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster'),
   async (req, res, next) => {
     try {
       const id = Number(req.params.id);
       const b = await bd.una('SELECT * FROM blaster WHERE id = ?', [id]);
       if (!b) return res.status(404).json({ error: 'El blaster no existe' });
+
+      const mias = await campanasDe(req.usuario);
+      if (mias !== null && !mias.includes(b.campana_id)) {
+        return res.status(403).json({ error: 'Ese blaster no es de tus campañas' });
+      }
 
       const nuevo = String(req.body.estado || '');
       /* Los nombres deben coincidir con los que admite la base. Antes
@@ -489,13 +502,16 @@ router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster_aprob
          base rechazaba la consulta con un error interno. */
       const aprobando = nuevo === 'aprobado' || nuevo === 'activo';
 
+      /* "Aprobar y lanzar" pasa directo a activo, así que quién y cuándo
+         aprobó se guarda también en ese caso. COALESCE conserva el dato
+         original al reanudar un blaster pausado. */
       await bd.consultar(
         `UPDATE blaster SET estado = ?,
                 aprobado     = CASE WHEN ? THEN TRUE ELSE aprobado END,
-                aprobado_por = CASE WHEN ? = 'aprobado' THEN ? ELSE aprobado_por END,
-                aprobado_en  = CASE WHEN ? = 'aprobado' THEN NOW() ELSE aprobado_en END
+                aprobado_por = CASE WHEN ? THEN COALESCE(aprobado_por, ?) ELSE aprobado_por END,
+                aprobado_en  = CASE WHEN ? THEN COALESCE(aprobado_en, NOW()) ELSE aprobado_en END
           WHERE id = ?`,
-        [nuevo, aprobando, nuevo, req.usuario.id, nuevo, id]);
+        [nuevo, aprobando, aprobando, req.usuario.id, aprobando, id]);
 
       await auth.auditar(req.usuario.id, 'modificar', 'blaster', id,
         `Pasó el blaster "${b.nombre}" a ${nuevo}`, req.ip);
