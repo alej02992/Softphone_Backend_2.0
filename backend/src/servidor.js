@@ -17,6 +17,7 @@ const cors = require('cors');
 const CONFIG = require('./config');
 const ami = require('./ami');
 const motor = require('./motor');
+const motorBlaster = require('./blaster-motor');
 const bd = require('./bd');
 
 const app = express();
@@ -25,7 +26,9 @@ const app = express();
    Se ejecutan en orden, antes de llegar a cualquier ruta.            */
 
 app.use(cors());              // permite que el navegador llame desde otro puerto
-app.use(express.json());      // entiende los cuerpos en JSON
+/* 15 MB: los archivos de Excel y los audios viajan dentro del JSON
+   codificados en texto, y el límite por defecto son 100 KB. */
+app.use(express.json({ limit: '15mb' }));
 
 /* Registro de peticiones: útil mientras se desarrolla */
 app.use((req, res, next) => {
@@ -56,10 +59,22 @@ app.get('/api/salud', async (req, res) => {
   }
 });
 
+/* La política de contraseñas se aplica como una capa delante de las
+   rutas de sesión: cuenta los intentos fallidos y revisa las
+   contraseñas nuevas sin tocar el inicio de sesión. */
+app.use('/api/sesion', require('./politica').vigilarAcceso());
 app.use('/api/sesion', require('./rutas/sesion'));
+app.use('/api', require('./rutas/seguridad'));
+app.use('/api', require('./rutas/reportes'));
+app.use('/api', require('./rutas/tipificador'));
+app.use('/api', require('./rutas/troncales'));
 app.use('/api/usuarios', require('./rutas/usuarios'));
-app.use('/api/grabaciones', require('./rutas/grabaciones'));
-app.use('/api', require('./rutas/vivo'));
+app.use('/api', require('./rutas/llamadas'));
+app.use('/api', require('./rutas/estados'));
+app.use('/api', require('./rutas/marcacion'));
+app.use('/api', require('./rutas/archivos'));
+app.use('/api', require('./rutas/blaster'));
+app.use('/api', require('./rutas/sms'));
 app.use('/api', require('./rutas/operacion'));
 
 
@@ -110,19 +125,21 @@ async function arrancar() {
   console.log(`  Realtime         ${CONFIG.realtime ? 'activo' : 'desactivado'}`);
 
   /* Canal de control con Asterisk. Se conecta solo y se reconecta si
-       se cae; los avisos salen por consola para que queden en PM2. */
-   if (ami.habilitado) {
+     se cae; los avisos salen por consola para que queden en PM2. */
+  if (ami.habilitado) {
     ami.on('listo', () => console.log('  Asterisk (AMI)   conectado'));
     ami.on('desconectado', (motivo) =>
       console.log(`  Asterisk (AMI)   desconectado${motivo ? ': ' + motivo : ''}`));
     ami.conectar();
     motor.arrancar();
+    motorBlaster.arrancar();
     console.log('  Asterisk (AMI)   conectando…');
     console.log('  Marcación        motor activo');
+    console.log('  Blaster          motor activo');
   } else {
     console.log('  Asterisk (AMI)   desactivado');
   }
- 
+
   app.listen(CONFIG.puerto, () => {
     console.log(`  Escuchando en    http://localhost:${CONFIG.puerto}`);
     console.log();
@@ -130,8 +147,7 @@ async function arrancar() {
     console.log();
   });
 }
- 
+
 if (require.main === module) arrancar();
- 
+
 module.exports = { app, arrancar };
- 

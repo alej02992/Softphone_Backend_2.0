@@ -102,6 +102,9 @@ const FIRMAS = [
   { ext: '.mp3', prueba: (b) => b.slice(0, 3).toString() === 'ID3' || (b[0] === 0xFF && (b[1] & 0xE0) === 0xE0) },
   { ext: '.wav', prueba: (b) => b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WAVE' },
   { ext: '.ogg', prueba: (b) => b.slice(0, 4).toString() === 'OggS' },
+  /* El formato de la Grabadora de sonido de Windows y de los celulares.
+     Se reconoce porque trae "ftyp" a partir del cuarto byte. */
+  { ext: '.m4a', prueba: (b) => b.slice(4, 8).toString() === 'ftyp' },
 ];
 
 /** Asterisk reproduce mejor un wav de 8 kHz mono. Si hay herramienta
@@ -158,21 +161,29 @@ router.post('/archivos/audio', auth.exigirSesion, auth.exigir('blaster'),
       const rutaCruda = path.join(CARPETA_AUDIO, archivoCrudo);
       await fsp.writeFile(rutaCruda, datos);
 
-      /* Se intenta dejarlo en el formato que mejor reproduce Asterisk */
-      let archivo = archivoCrudo;
-      let nota = null;
+      /* Se convierte SIEMPRE al formato del teléfono: wav, 8 kHz, mono.
 
-      if (firma.ext !== '.wav') {
-        const convertido = `${limpio}-${marca}.wav`;
-        const r = await convertir(rutaCruda, path.join(CARPETA_AUDIO, convertido));
-        if (r.convertido) {
-          archivo = convertido;
-          await fsp.unlink(rutaCruda).catch(() => {});
-        } else {
-          nota = 'No se pudo convertir a wav: se guardó tal cual. ' +
-                 'Instala sox o ffmpeg en el servidor si Asterisk no lo reproduce.';
-        }
+         Antes los .wav se dejaban como llegaban, pero un wav normal de
+         Windows es de 44 kHz y estéreo, y Asterisk no lo reproduce: la
+         llamada salía y el cliente escuchaba silencio. */
+      const convertido = `${limpio}-${marca}-8k.wav`;
+      const r = await convertir(rutaCruda, path.join(CARPETA_AUDIO, convertido));
+
+      if (!r.convertido) {
+        await fsp.unlink(rutaCruda).catch(() => {});
+
+        /* Sin convertir, el audio no sirve para una llamada. Guardarlo
+           igual sería peor: el blaster saldría y nadie oiría nada.
+           Mejor decirlo ahora, con la solución. */
+        return res.status(422).json({
+          error: 'No se pudo preparar el audio para el teléfono. ' +
+                 'Falta instalar ffmpeg en el servidor: dnf install ffmpeg',
+        });
       }
+
+      await fsp.unlink(rutaCruda).catch(() => {});
+      const archivo = convertido;
+      const nota = null;
 
       await auth.auditar(req.usuario.id, 'crear', 'audio', null,
         `Subió el audio ${archivo}`, req.ip);
