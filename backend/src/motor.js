@@ -1,304 +1,273 @@
 /* ═══════════════════════════════════════════════════════════════════
-   MOTOR DE MARCACIÓN AUTOMÁTICA
+   MOTOR DEL BLASTER
 
-   Un ciclo que se repite cada pocos segundos y hace siempre lo mismo:
+   Toma los destinatarios de los blasters activos y los llama. Cuando
+   el cliente contesta, la central le reproduce el mensaje y cuelga.
 
-     1. ¿Qué bases están activas, en marcación automática y en horario?
-     2. ¿Qué agentes de esa campaña están conectados y libres?
-     3. Por cada agente libre, tomar el siguiente contacto y ordenarle
-        a Asterisk que marque.
-     4. Escuchar qué pasó con cada llamada y anotarlo.
+   ES UN ARCHIVO APARTE DEL MOTOR DE MARCACIÓN, A PROPÓSITO
+   El de marcación reparte llamadas entre agentes y está probado en
+   producción. Este no tiene agentes: marca al cliente y reproduce un
+   audio. Mezclarlos habría puesto en riesgo lo que ya funciona.
 
-   QUÉ SIGNIFICA "LIBRE"
-   Un agente está libre si tiene la sesión abierta, no está en pausa y
-   no tiene ningún contacto en la mano. Esto último es la clave: en
-   cuanto se le asigna uno, deja de estar libre, así que el ciclo
-   siguiente no le manda otro.
+   CÓMO FUNCIONA
+   Un ciclo cada cinco segundos:
+     1. Busca blasters en curso, aprobados y dentro de su horario.
+     2. Cuenta cuántas llamadas hay en curso y respeta el tope.
+     3. Toma destinatarios pendientes, genera su audio si hace falta
+        y ordena llamarlos.
+     4. Cuando la central responde, anota si contestaron o no.
+     5. Si ya no queda nadie por llamar, da el blaster por terminado.
 
-   SI EL AGENTE NO CONTESTA SU PROPIA EXTENSIÓN
-   El contacto vuelve a la cola SIN contar como intento: el cliente
-   nunca supo que lo llamaron, así que sería injusto gastarle un
-   intento. Y si al agente le pasa dos veces seguidas, se le pone en
-   pausa automáticamente: algo le ocurre y no tiene sentido seguir
-   mandándole llamadas que nadie atiende.
-
-   POR QUÉ UN CICLO Y NO REACCIONAR A EVENTOS
-   Un ciclo que mira el estado real cada pocos segundos se recupera
-   solo de cualquier fallo: si se perdió un evento, si se cayó el AMI,
-   si alguien tocó la base a mano, la siguiente vuelta lo corrige. Un
-   motor basado solo en eventos se queda trabado cuando pierde uno.
+   Igual que el motor de marcación, es un ciclo y no una reacción a
+   eventos: si se pierde un aviso de la central, la vuelta siguiente
+   lo corrige.
    ═══════════════════════════════════════════════════════════════════ */
 'use strict';
 
+const path = require('path');
 const bd = require('./bd');
 const ami = require('./ami');
+const voz = require('./voz');
+const CONFIG = require('./config');
 
-/* Cada cuánto se repite el ciclo */
-const CICLO_MS = 4000;
-/* Cuánto se espera a que alguien conteste antes de darla por perdida */
-const ESPERA_TIMBRE = 30;
-/* Si una llamada lleva más de esto "llamando", algo se perdió */
+/* Cada cuánto se revisa */
+const CICLO_MS = 5000;
+
+/* Cuántas llamadas del blaster puede haber a la vez, sumando todos.
+   Cada una ocupa un canal de la troncal: si se pasa del límite del
+   operador, las llamadas fallan o, peor, bloquean las de los agentes. */
+const SIMULTANEAS = Number(process.env.BLASTER_SIMULTANEAS) || 5;
+
+/* Una llamada que no recibió respuesta de la central en este tiempo se
+   da por perdida y se cuenta como intento. */
 const MINUTOS_ATASCO = 3;
-/* Cuántas veces seguidas puede un agente no contestar antes de pausarlo */
-const FALLOS_PARA_PAUSA = 2;
 
 let reloj = null;
 let trabajando = false;
-const fallosPorAgente = new Map();
 
-/* Qué contacto corresponde a cada llamada ordenada.
-   Asterisk avisa el resultado con el mismo identificador con el que se
-   le pidió marcar, pero NO devuelve las variables que se le mandaron.
-   Por eso la correspondencia se guarda aquí, y además se deja el número
-   como respaldo por si llega un aviso sin identificador. */
-const llamadasEnCurso = new Map();
-const historial = [];          // últimas decisiones, para diagnóstico
+/* Las llamadas en vuelo: identificador de la orden → destinatario.
+   La central devuelve ese mismo identificador cuando responde, y es la
+   forma fiable de saber a qué número corresponde cada aviso. */
+const enVuelo = new Map();
 
+const ultimas = [];
 function anotar(texto) {
-  historial.unshift({ cuando: new Date(), texto });
-  historial.length = Math.min(historial.length, 50);
+  ultimas.unshift({ cuando: new Date().toISOString(), texto });
+  if (ultimas.length > 30) ultimas.length = 30;
 }
 
-/* ═══════════ CONSULTAS ═══════════ */
+/* ═══════════ QUÉ TOCA LLAMAR ═══════════ */
 
-/** Bases que deben estar marcando ahora mismo. */
-async function basesActivas() {
-  const ahora = new Date();
-  const dia = ['D', 'L', 'M', 'X', 'J', 'V', 'S'][ahora.getDay()];
-  const hora = ahora.toTimeString().slice(0, 8);
+const DIAS = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
 
-  const filas = await bd.consultar(
-    `SELECT id, campana_id, nombre, simultaneas, dias, hora_inicio, hora_fin
-       FROM base
-      WHERE estado = 'activa' AND marcacion_auto = TRUE
-        AND ? BETWEEN hora_inicio AND hora_fin`, [hora]);
+/** Los blasters que pueden marcar ahora mismo. */
+async function blastersActivos() {
+  const hoy = DIAS[new Date().getDay()];
 
-  return filas.filter((b) =>
-    String(b.dias).split(',').map((d) => d.trim()).includes(dia));
+  return bd.consultar(
+    `SELECT id, nombre, tipo, guion, audio_archivo, voz_id,
+            respuesta, respuesta_digitos, reintentos, intervalo_min
+       FROM blaster
+      WHERE estado = 'activo'
+        AND aprobado = TRUE
+        AND CURTIME() BETWEEN hora_inicio AND hora_fin
+        AND FIND_IN_SET(?, dias) > 0`, [hoy]);
 }
+
+/** Cuántas llamadas del blaster están en curso, en total. */
+async function enCurso() {
+  const r = await bd.una(
+    "SELECT COUNT(*) AS n FROM blaster_destinatario WHERE estado = 'llamando'");
+  return Number(r.n) || 0;
+}
+
+/* ═══════════ EL AUDIO DE CADA DESTINATARIO ═══════════ */
 
 /**
- * Agentes de una campaña listos para recibir una llamada: con sesión
- * abierta, sin pausa y sin ningún contacto en la mano.
+ * Devuelve la ruta que Asterisk necesita para reproducir el mensaje.
+ *
+ * Asterisk pide la ruta SIN extensión: elige solo el formato. Por eso
+ * se quita aquí.
+ *
+ *   audio grabado      → el mismo archivo para todos
+ *   texto              → se genera una vez y se reutiliza
+ *   texto con variables → uno por persona, con su nombre o sus datos
  */
-async function agentesLibres(campanaId) {
-  return bd.consultar(
-    `SELECT u.id, u.nombre, u.extension
-       FROM usuario u
-       JOIN sesion s ON s.usuario_id = u.id AND s.cerrada IS NULL AND s.vence > NOW()
-      WHERE u.activo = TRUE
-        AND u.campana_id = ?
-        AND u.extension IS NOT NULL
+async function audioPara(b, d) {
+  let archivo;
 
-        /* Solo agentes. Un supervisor también tiene extensión y sesión
-           abierta —la necesita para escuchar llamadas—, pero no está
-           ahí para atender la base. Sin esta condición, el motor le
-           empezaba a marcar como si fuera uno más. */
-        AND NOT EXISTS (
-          SELECT 1 FROM rol_permiso rp
-            JOIN permiso p ON p.id = rp.permiso_id
-           WHERE rp.rol_id = u.rol_id AND p.clave = 'supervision')
-        AND NOT EXISTS (SELECT 1 FROM pausa p
-                         WHERE p.usuario_id = u.id AND p.fin IS NULL)
-        /* Ocupado mientras tenga una llamada en curso, o mientras le
-           dure el tiempo de cierre después de colgar. Al vencer ese
-           tiempo vuelve a contar como libre aunque no haya tipificado:
-           así la operación no se detiene esperando a una persona. */
-        AND NOT EXISTS (
-          SELECT 1 FROM base_contacto c JOIN base b2 ON b2.id = c.base_id
-           WHERE c.agente_id = u.id
-             AND (c.estado = 'llamando'
-               OR (c.estado = 'asignado'
-                   AND (c.colgado_en IS NULL
-                        OR c.colgado_en > DATE_SUB(NOW(), INTERVAL b2.cierre_seg SECOND)))))
-      GROUP BY u.id`, [campanaId]);
+  if (b.tipo === 'audio') {
+    archivo = b.audio_archivo;
+
+  } else {
+    /* El texto, con las variables de cada persona reemplazadas */
+    let texto = String(b.guion || '');
+    if (b.tipo === 'variables') {
+      let datos = {};
+      try { datos = typeof d.datos === 'string' ? JSON.parse(d.datos) : (d.datos || {}); }
+      catch { datos = {}; }
+      datos.nombre = datos.nombre || d.nombre || '';
+      texto = texto.replace(/\{(\w+)\}/g, (_, k) => String(datos[k] ?? ''));
+    }
+
+    const r = await voz.generar(texto, b.voz_id, `blaster-${b.id}`);
+    if (r.error) throw new Error(r.error);
+    archivo = r.archivo;
+  }
+
+  if (!archivo) throw new Error('El blaster no tiene audio');
+
+  const ruta = path.isAbsolute(archivo) ? archivo : path.join(voz.CARPETA, archivo);
+  return ruta.replace(/\.(wav|ulaw|alaw|gsm|sln|mp3)$/i, '');
 }
 
-/** Toma el siguiente contacto para un agente. Se marca primero y se
-    lee después, igual que en el reparto manual: así dos ciclos no
-    pueden llevarse el mismo. */
-async function tomarContacto(baseId, agenteId) {
+/* ═══════════ LLAMAR ═══════════ */
+
+async function llamar(b, d) {
+  /* Primero se reserva el destinatario, después se lee. Si otro ciclo
+     estuviera corriendo a la vez, no podría tomar el mismo. Es la misma
+     lógica que evita en el motor de marcación que dos agentes reciban
+     el mismo contacto. */
   const [r] = await bd.pool.execute(
-    `UPDATE base_contacto
-        SET estado = 'llamando', agente_id = ?, asignado_en = NOW(), llamado_en = NOW()
-      WHERE base_id = ?
-        AND estado IN ('pendiente', 'agendado')
-        AND (proximo_intento IS NULL OR proximo_intento <= NOW())
-        AND (agendado_para IS NULL OR agendado_para <= NOW())
-        /* Nunca se vuelve a marcar a un número que ya se gestionó en
-           esta base, aunque aparezca repetido en el archivo. */
-        AND telefono_1 NOT IN (
-          SELECT telefono_1 FROM (
-            SELECT telefono_1 FROM base_contacto
-             WHERE base_id = ? AND estado IN ('gestionado','excluido')
-          ) AS ya)
-      ORDER BY (agendado_para IS NOT NULL) DESC, agendado_para ASC, id ASC
-      LIMIT 1`,
-    [agenteId, baseId, baseId]);
+    `UPDATE blaster_destinatario
+        SET estado = 'llamando', ultimo_intento = NOW()
+      WHERE id = ? AND estado = 'pendiente'`, [d.id]);
+  if (!r.affectedRows) return;
 
-  if (!r.affectedRows) return null;
+  let audio;
+  try {
+    audio = await audioPara(b, d);
+  } catch (e) {
+    /* Sin audio no tiene sentido llamar: el cliente contestaría y
+       escucharía silencio. Se marca el fallo y se sigue con el resto. */
+    await bd.consultar(
+      "UPDATE blaster_destinatario SET estado = 'fallida' WHERE id = ?", [d.id]);
+    anotar(`Destinatario ${d.id}: no se pudo generar el audio (${e.message})`);
+    return;
+  }
 
-  return bd.una(
-    `SELECT id, telefono_1, telefono_2, nombre, intentos
-       FROM base_contacto
-      WHERE agente_id = ? AND estado = 'llamando'
-      ORDER BY llamado_en DESC, id DESC LIMIT 1`, [agenteId]);
+  try {
+    const resp = await ami.originarBlaster({
+      numero: d.numero,
+      audio,
+      digitos: b.respuesta ? (b.respuesta_digitos || 1) : 0,
+      identificador: `blaster-${d.id}`,
+      contextoSalida: CONFIG.blaster?.contextoSalida || 'from-internal',
+    });
+
+    if (resp?.ActionID) enVuelo.set(resp.ActionID, d.id);
+    anotar(`Llamando a ${d.numero} (${b.nombre})`);
+  } catch (e) {
+    await terminarIntento(d.id, b, false);
+    anotar(`No se pudo llamar a ${d.numero}: ${e.message}`);
+  }
 }
 
-/** Llamadas que quedaron colgadas: se ordenó marcar y nunca llegó el
-    resultado. Vuelven a la cola sin gastar intento. */
+/* ═══════════ EL RESULTADO ═══════════ */
+
+/**
+ * Cierra un intento: contestó, o no contestó y quizá se reintenta.
+ */
+async function terminarIntento(destinoId, b, contesto) {
+  if (contesto) {
+    await bd.consultar(
+      `UPDATE blaster_destinatario
+          SET estado = 'contestada', intentos = intentos + 1
+        WHERE id = ?`, [destinoId]);
+    return;
+  }
+
+  const d = await bd.una(
+    'SELECT intentos FROM blaster_destinatario WHERE id = ?', [destinoId]);
+  const intentos = (d?.intentos || 0) + 1;
+  const quedan = intentos <= (b?.reintentos ?? 2);
+
+  await bd.consultar(
+    `UPDATE blaster_destinatario
+        SET estado = ?, intentos = ?, proximo_intento = ?
+      WHERE id = ?`,
+    [quedan ? 'pendiente' : 'sin_respuesta', intentos,
+     quedan ? new Date(Date.now() + (b?.intervalo_min || 30) * 60000) : null,
+     destinoId]);
+}
+
+/** La central avisó qué pasó con una llamada que se ordenó. */
+async function alResponder(e) {
+  const destinoId = enVuelo.get(e.ActionID);
+  if (!destinoId) return;                    // no es nuestra
+  enVuelo.delete(e.ActionID);
+
+  const d = await bd.una(
+    `SELECT d.id, b.reintentos, b.intervalo_min
+       FROM blaster_destinatario d JOIN blaster b ON b.id = d.blaster_id
+      WHERE d.id = ?`, [destinoId]);
+  if (!d) return;
+
+  /* "Success" significa que el cliente contestó y se le pasó al
+     contexto que reproduce el audio. Cualquier otra cosa —no contestó,
+     ocupado, número inválido— cuenta como intento fallido. */
+  const contesto = e.Response === 'Success';
+  await terminarIntento(destinoId, d, contesto);
+}
+
+/* ═══════════ LIMPIEZA ═══════════ */
+
+/** Las que quedaron "llamando" sin respuesta de la central. */
 async function soltarAtascadas() {
   const atascadas = await bd.consultar(
-    `SELECT c.id, c.agente_id, c.intentos, b.reintentos, b.intervalo_min
-       FROM base_contacto c JOIN base b ON b.id = c.base_id
-      WHERE c.estado = 'llamando'
-        AND c.llamado_en < DATE_SUB(NOW(), INTERVAL ? MINUTE)`, [MINUTOS_ATASCO]);
+    `SELECT d.id, b.reintentos, b.intervalo_min
+       FROM blaster_destinatario d JOIN blaster b ON b.id = d.blaster_id
+      WHERE d.estado = 'llamando'
+        AND d.ultimo_intento < DATE_SUB(NOW(), INTERVAL ? MINUTE)`, [MINUTOS_ATASCO]);
 
-  for (const c of atascadas) {
-    /* Cuenta como intento. Si no se contara, una llamada cuyo resultado
-       nunca llega se repetiría sin límite a la misma persona: es lo que
-       pasaba antes de cruzar bien los avisos de la central. */
-    const intentos = (c.intentos || 0) + 1;
-    const quedan = intentos <= (c.reintentos ?? 2);
-
-    await bd.consultar(
-      `UPDATE base_contacto
-          SET estado = ?, intentos = ?, ultimo_intento = NOW(), proximo_intento = ?,
-              resultado = COALESCE(resultado, 'Sin respuesta de la central'),
-              agente_id = NULL, asignado_en = NULL, canal = NULL
-        WHERE id = ?`,
-      [quedan ? 'pendiente' : 'sin_contacto', intentos,
-       quedan ? new Date(Date.now() + (c.intervalo_min || 60) * 60000) : null, c.id]);
-
-    anotar(`Contacto ${c.id} sin respuesta de la central. Intento ${intentos}` +
-           (quedan ? '' : ': se cierra sin contacto'));
+  for (const d of atascadas) {
+    await terminarIntento(d.id, d, false);
+    anotar(`Destinatario ${d.id}: sin respuesta de la central, se reintentará`);
   }
+}
+
+/** Los blasters que ya no tienen a nadie por llamar. */
+async function cerrarTerminados() {
+  await bd.consultar(
+    `UPDATE blaster b SET b.estado = 'terminado'
+      WHERE b.estado = 'activo'
+        AND NOT EXISTS (
+          SELECT 1 FROM blaster_destinatario d
+           WHERE d.blaster_id = b.id AND d.estado IN ('pendiente','llamando'))`);
 }
 
 /* ═══════════ EL CICLO ═══════════ */
 
-/**
- * Cierra las gestiones cuya ventana de tipificación ya venció.
- *
- * Si el agente colgó y no escribió el resultado dentro del tiempo de
- * cierre, la gestión se guarda igual marcada como sin tipificar. Si no
- * se hiciera, un agente distraído dejaría contactos bloqueados y la
- * base se iría frenando sola.
- */
-async function cerrarVencidas() {
-  const vencidas = await bd.consultar(
-    `SELECT c.id, c.agente_id
-       FROM base_contacto c JOIN base b ON b.id = c.base_id
-      WHERE c.estado = 'asignado'
-        AND b.marcacion_auto = TRUE
-        AND c.colgado_en IS NOT NULL
-        AND c.colgado_en <= DATE_SUB(NOW(), INTERVAL b.cierre_seg SECOND)`);
-
-  for (const c of vencidas) {
-    await bd.consultar(
-      `UPDATE base_contacto
-          SET estado = 'gestionado', gestionado_en = NOW(),
-              resultado = COALESCE(resultado, 'Sin tipificar'),
-              intentos = intentos + 1, ultimo_intento = NOW()
-        WHERE id = ? AND estado = 'asignado'`, [c.id]);
-    anotar(`Contacto ${c.id}: se cerró solo al vencer el tiempo de cierre`);
-  }
-}
-
 async function vuelta() {
-  if (trabajando) return;            // no se solapan dos vueltas
-  if (!ami.estado().conectado) return;
-
+  if (trabajando) return;
+  if (!ami.estado().conectado) return;       // sin central no hay nada que hacer
   trabajando = true;
+
   try {
     await soltarAtascadas();
 
-    /* Quién está hablando ahora mismo, según la central. Si un agente
-       marcó por su cuenta, no se le manda una llamada automática
-       encima. Se pregunta una vez por vuelta, no por agente. */
-    let ocupadas = new Set();
-    try { ocupadas = await ami.extensionesEnLlamada(); }
-    catch { /* si falla la consulta, se sigue con lo que se sabe */ }
+    let libres = SIMULTANEAS - await enCurso();
+    if (libres <= 0) return;
 
-    /* ── Quién ya colgó ──
+    for (const b of await blastersActivos()) {
+      if (libres <= 0) break;
 
-       El fin de la llamada se detectaba solo con el aviso de Asterisk,
-       cruzado por el nombre del canal. Si ese nombre no coincidía
-       exactamente, el contacto se quedaba "en manos" del agente para
-       siempre y el motor no le volvía a mandar ninguna llamada.
+      const destinos = await bd.consultar(
+        `SELECT id, numero, nombre, datos
+           FROM blaster_destinatario
+          WHERE blaster_id = ? AND estado = 'pendiente'
+            AND (proximo_intento IS NULL OR proximo_intento <= NOW())
+            AND numero NOT IN (SELECT numero FROM no_llamar)
+          ORDER BY id
+          LIMIT ?`, [b.id, libres]);
 
-       Ahora se mira la realidad: si el agente tiene un contacto
-       asignado y su extensión NO está en ninguna llamada, es que ya
-       colgó. Desde ahí corre su tiempo de cierre. */
-    const enMano = await bd.consultar(
-      `SELECT c.id, u.extension
-         FROM base_contacto c JOIN usuario u ON u.id = c.agente_id
-        WHERE c.estado = 'asignado' AND c.colgado_en IS NULL`);
-
-    for (const c of enMano) {
-      if (!ocupadas.has(String(c.extension))) {
-        await bd.consultar(
-          'UPDATE base_contacto SET colgado_en = NOW() WHERE id = ? AND colgado_en IS NULL',
-          [c.id]);
+      for (const d of destinos) {
+        await llamar(b, d);
+        libres--;
       }
     }
 
-    /* El cierre va DESPUÉS de detectar quién colgó, en la misma vuelta.
-       Si fuera antes, haría falta una vuelta para notar que colgó y
-       otra para cerrar: el agente esperaría su tiempo de cierre más dos
-       vueltas enteras entre llamada y llamada. */
-    await cerrarVencidas();
-
-    for (const base of await basesActivas()) {
-      const todos = await agentesLibres(base.campana_id);
-      const libres = todos.filter((a) => !ocupadas.has(String(a.extension)));
-
-      if (todos.length && !libres.length) {
-        anotar('Todos los agentes libres están en una llamada propia');
-      }
-      if (!libres.length) continue;
-
-      /* Con simultaneas en 1 se marca una llamada por agente libre.
-         Por encima de 1 se marca de más —predictiva—, con el riesgo de
-         que alguien conteste y no haya agente. */
-      const cuantas = Math.max(1, Math.round(libres.length * Number(base.simultaneas || 1)));
-
-      for (let i = 0; i < Math.min(cuantas, libres.length); i++) {
-        const agente = libres[i];
-        const contacto = await tomarContacto(base.id, agente.id);
-        if (!contacto) break;        // no quedan contactos en esta base
-
-        /* Si ya se intentó y hay segundo teléfono, se usa ese */
-        const numero = (contacto.intentos > 0 && contacto.telefono_2)
-          ? contacto.telefono_2 : contacto.telefono_1;
-
-        try {
-          const orden = await ami.originar({
-            numero,
-            extension: agente.extension,
-            identificador: String(contacto.id),
-            espera: ESPERA_TIMBRE,
-            datos: { BPM_AGENTE: agente.id, BPM_BASE: base.id },
-          });
-          /* Se apunta a qué contacto pertenece esta llamada */
-          if (orden?.__id) {
-            llamadasEnCurso.set(orden.__id, { contacto: contacto.id, numero });
-            /* No se guarda para siempre: si el aviso nunca llega, esta
-               entrada se limpia sola. */
-            setTimeout(() => llamadasEnCurso.delete(orden.__id), 5 * 60000);
-          }
-          anotar(`Marcando ${numero} para ${agente.nombre}`);
-        } catch (e) {
-          /* No se pudo ni ordenar la llamada: el contacto vuelve a la
-             cola sin gastar intento, porque el cliente no supo nada. */
-          await bd.consultar(
-            `UPDATE base_contacto
-                SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL
-              WHERE id = ?`, [contacto.id]);
-          anotar(`No se pudo marcar a ${numero}: ${e.message}`);
-        }
-      }
-    }
+    await cerrarTerminados();
   } catch (e) {
     anotar('Error en el ciclo: ' + e.message);
   } finally {
@@ -306,161 +275,29 @@ async function vuelta() {
   }
 }
 
-/* ═══════════ LO QUE RESPONDE ASTERISK ═══════════ */
-
-/**
- * Asterisk avisa cómo terminó cada intento de llamada. De aquí sale
- * saber si contestaron sin que el agente tenga que decirlo.
- */
-async function alResponder(evento) {
-  /* Cómo se sabe de qué contacto habla este aviso.
-
-     Asterisk responde con el mismo identificador con el que se le pidió
-     marcar, así que esa es la vía principal. Si por alguna razón no
-     llega, se busca por el número marcado entre las llamadas en curso:
-     vale más resolverlo por el número que perder el resultado y acabar
-     llamando dos veces a la misma persona. */
-  let id = null;
-
-  const apuntado = llamadasEnCurso.get(evento.ActionID);
-  if (apuntado) {
-    id = apuntado.contacto;
-    llamadasEnCurso.delete(evento.ActionID);
-  } else if (evento.Exten) {
-    const porNumero = await bd.una(
-      `SELECT id FROM base_contacto
-        WHERE estado = 'llamando'
-          AND (telefono_1 = ? OR telefono_2 = ?)
-        ORDER BY llamado_en DESC LIMIT 1`, [evento.Exten, evento.Exten]);
-    if (porNumero) id = porNumero.id;
-  }
-
-  if (!id) return;
-
-  const c = await bd.una(
-    `SELECT c.*, b.reintentos, b.intervalo_min
-       FROM base_contacto c JOIN base b ON b.id = c.base_id
-      WHERE c.id = ? AND c.estado = 'llamando'`, [id]);
-  if (!c) return;
-
-  const exito = String(evento.Response || '').toLowerCase() === 'success';
-  const motivo = String(evento.Reason || evento.Cause || '');
-
-  /* ── Contestaron: el agente ya está hablando ──
-     El contacto queda en sus manos; él dirá cómo terminó. */
-  if (exito) {
-    await bd.consultar(
-      `UPDATE base_contacto SET estado = 'asignado', canal = ? WHERE id = ?`,
-      [evento.Channel || null, id]);
-    fallosPorAgente.delete(c.agente_id);
-    anotar(`Contacto ${id}: conectado con el agente`);
-    return;
-  }
-
-  /* ── No se logró la llamada ──
-     Hay dos casos muy distintos y conviene separarlos. */
-
-  /* El agente no contestó su propia extensión. El cliente nunca supo
-     nada, así que no se le gasta un intento. */
-  const culpaDelAgente = /noanswer|no answer|busy|chanunavail|congestion/i.test(motivo)
-    && evento.Contexto === 'agente';
-
-  if (culpaDelAgente) {
-    await bd.consultar(
-      `UPDATE base_contacto
-          SET estado = 'pendiente', agente_id = NULL, asignado_en = NULL, canal = NULL
-        WHERE id = ?`, [id]);
-
-    const fallos = (fallosPorAgente.get(c.agente_id) || 0) + 1;
-    fallosPorAgente.set(c.agente_id, fallos);
-    anotar(`El agente no contestó (${fallos} seguidas). El contacto vuelve a la cola.`);
-
-    /* Dos veces seguidas: se le pone en pausa para dejar de mandarle
-       llamadas que nadie atiende. */
-    if (fallos >= FALLOS_PARA_PAUSA) {
-      await pausarAgente(c.agente_id);
-      fallosPorAgente.delete(c.agente_id);
-    }
-    return;
-  }
-
-  /* El cliente no contestó: sí cuenta como intento. */
-  const intentos = c.intentos + 1;
-  const quedan = intentos <= c.reintentos;
-
-  await bd.consultar(
-    `UPDATE base_contacto
-        SET estado = ?, intentos = ?, ultimo_intento = NOW(), proximo_intento = ?,
-            resultado = ?, agente_id = NULL, asignado_en = NULL, canal = NULL
-      WHERE id = ?`,
-    [quedan ? 'pendiente' : 'sin_contacto', intentos,
-     quedan ? new Date(Date.now() + c.intervalo_min * 60000) : null,
-     motivo ? `Sin respuesta (${motivo})` : 'No contesta', id]);
-
-  anotar(`Contacto ${id}: no contestó. Intento ${intentos} de ${c.reintentos + 1}`);
-}
-
-/**
- * Asterisk avisa cuando se cuelga un canal. Si era el de una gestión en
- * curso, aquí empieza a contar el tiempo que tiene el agente para
- * escribir el resultado antes de que entre la siguiente llamada.
- */
-async function alColgar(evento) {
-  const [r] = await bd.pool.execute(
-    `UPDATE base_contacto SET colgado_en = NOW()
-      WHERE canal = ? AND estado = 'asignado' AND colgado_en IS NULL`,
-    [evento.Channel]);
-
-  if (r.affectedRows) anotar(`Llamada terminada en ${evento.Channel}: empieza el cierre`);
-}
-
-/** Pone al agente en pausa porque no está atendiendo las llamadas. */
-async function pausarAgente(usuarioId) {
-  try {
-    const tipo = await bd.una(
-      `SELECT id FROM pausa_tipo WHERE activo = TRUE ORDER BY id LIMIT 1`);
-    if (!tipo) return;
-
-    await bd.consultar(
-      'UPDATE pausa SET fin = NOW() WHERE usuario_id = ? AND fin IS NULL', [usuarioId]);
-    await bd.consultar(
-      'INSERT INTO pausa (usuario_id, pausa_tipo_id, inicio) VALUES (?, ?, NOW())',
-      [usuarioId, tipo.id]);
-
-    anotar(`Agente ${usuarioId} puesto en pausa: no contestó dos llamadas seguidas`);
-  } catch (e) {
-    anotar('No se pudo pausar al agente: ' + e.message);
-  }
-}
-
-/* ═══════════ ARRANQUE ═══════════ */
+/* ═══════════ ARRANCAR ═══════════ */
 
 function arrancar() {
   if (reloj) return;
 
-  /* Los eventos de Asterisk que interesan. OriginateResponse llega
-     cuando termina el intento de llamada. */
   ami.on('evento', (e) => {
     if (e.Event === 'OriginateResponse') alResponder(e).catch(() => {});
-    /* Al colgar empieza a correr el tiempo de cierre del agente */
-    if (e.Event === 'Hangup' && e.Channel) alColgar(e).catch(() => {});
   });
 
-  reloj = setInterval(() => { vuelta().catch(() => {}); }, CICLO_MS);
-  anotar('Motor de marcación iniciado');
+  reloj = setInterval(vuelta, CICLO_MS);
+  anotar('Motor del blaster iniciado');
 }
 
 function detener() {
   clearInterval(reloj);
   reloj = null;
-  anotar('Motor de marcación detenido');
 }
 
-/** Para mostrar en la plataforma qué está haciendo. */
 const estado = () => ({
   andando: !!reloj,
-  canal: ami.estado(),
-  ultimas: historial.slice(0, 15),
+  enVuelo: enVuelo.size,
+  simultaneas: SIMULTANEAS,
+  ultimas: ultimas.slice(0, 15),
 });
 
 module.exports = { arrancar, detener, estado, vuelta };

@@ -25,6 +25,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const CONFIG = require('./config');
 
 /* Asterisk reproduce mejor los archivos ya convertidos; aquí se guarda
@@ -35,8 +36,14 @@ const CARPETA = (CONFIG.tts && CONFIG.tts.carpeta) || '/var/lib/asterisk/sounds/
 const proveedor = () => (CONFIG.tts && CONFIG.tts.proveedor) || 'ninguno';
 const clave = () => (CONFIG.tts && CONFIG.tts.clave) || '';
 
-/** Hay servicio de voz configurado y con credencial. */
-const disponible = () => proveedor() !== 'ninguno' && !!clave();
+/** Hay servicio de voz configurado. Piper corre en el propio servidor
+    y no lleva credencial; los servicios en la nube sí la necesitan. */
+const disponible = () => {
+  const p = proveedor();
+  if (p === 'ninguno') return false;
+  if (p === 'piper') return true;
+  return !!clave();
+};
 
 async function asegurarCarpeta() {
   try { await fsp.mkdir(CARPETA, { recursive: true }); } catch { /* ya existe */ }
@@ -53,14 +60,21 @@ async function elevenlabs(texto, vozId) {
   const voz = vozId || CONFIG.tts.vozPorDefecto;
   if (!voz) return { error: 'Falta indicar la voz (TTS_VOZ en el servidor)' };
 
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voz)}`;
+  /* Se pide el audio ya en formato telefónico: μ-law a 8 kHz, que es
+     exactamente lo que transporta una llamada.
+
+     Antes se pedía MP3, y una instalación normal de Asterisk NO
+     reproduce MP3: el cliente contestaba y escuchaba silencio. Con
+     μ-law, Asterisk lo reproduce tal cual, sin convertir nada. */
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voz)}` +
+              '?output_format=ulaw_8000';
 
   const r = await fetch(url, {
     method: 'POST',
     headers: {
       'xi-api-key': clave(),
       'Content-Type': 'application/json',
-      Accept: 'audio/mpeg',
+      Accept: 'audio/basic',
     },
     body: JSON.stringify({
       text: texto,
@@ -75,6 +89,54 @@ async function elevenlabs(texto, vozId) {
     return { error: `El servicio de voz respondió ${r.status}. ${detalle}` };
   }
   return { audio: Buffer.from(await r.arrayBuffer()) };
+}
+
+/* ═══════════ PIPER ═══════════
+
+   Motor neuronal gratuito (licencia MIT) que corre en el propio
+   servidor, sin GPU y sin internet. Suena algo menos natural que un
+   servicio de pago, pero tiene una ventaja decisiva: ningún dato del
+   cliente sale de la empresa. Para mensajes con nombres o valores de
+   factura, eso evita el problema de habeas data.
+
+   Necesita el programa `piper` y un archivo de voz .onnx en el
+   servidor. Se configuran con TTS_PIPER y TTS_VOZ. */
+
+function piper(texto, vozId) {
+  return new Promise((resolve) => {
+    const programa = CONFIG.tts.piper || 'piper';
+    const modelo = vozId || CONFIG.tts.vozPorDefecto;
+    if (!modelo) return resolve({ error: 'Falta el archivo de voz (TTS_VOZ)' });
+
+    const salida = path.join(CARPETA, `piper-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`);
+
+    const proc = spawn(programa, ['--model', modelo, '--output_file', salida]);
+    let errores = '';
+
+    proc.stderr.on('data', (d) => { errores += d.toString().slice(0, 500); });
+
+    proc.on('error', (e) => resolve({
+      error: e.code === 'ENOENT'
+        ? `No se encontró el programa "${programa}". Instálalo o ajusta TTS_PIPER.`
+        : 'No se pudo ejecutar Piper: ' + e.message,
+    }));
+
+    proc.on('close', async (codigo) => {
+      if (codigo !== 0) {
+        return resolve({ error: `Piper terminó con error ${codigo}. ${errores.slice(0, 160)}` });
+      }
+      try {
+        const audio = await fsp.readFile(salida);
+        await fsp.unlink(salida).catch(() => {});
+        resolve({ audio, extension: '.wav' });
+      } catch (e) {
+        resolve({ error: 'Piper no dejó el archivo: ' + e.message });
+      }
+    });
+
+    proc.stdin.write(texto);
+    proc.stdin.end();
+  });
 }
 
 /* ═══════════ PUNTO DE ENTRADA ═══════════ */
@@ -94,7 +156,11 @@ async function generar(texto, vozId, base = 'blaster') {
   }
 
   await asegurarCarpeta();
-  const archivo = nombreDe(base, limpio, vozId);
+  /* Cada proveedor entrega un formato distinto: ElevenLabs μ-law y
+     Piper wav. Asterisk reproduce los dos sin convertir. La extensión
+     importa: Asterisk decide cómo leer el archivo por ella. */
+  const extension = proveedor() === 'piper' ? '.wav' : '.ulaw';
+  const archivo = nombreDe(base, limpio, vozId).replace(/\.mp3$/, extension);
   const ruta = path.join(CARPETA, archivo);
 
   /* Si ya se generó ese mismo texto, se reutiliza */
@@ -103,6 +169,7 @@ async function generar(texto, vozId, base = 'blaster') {
   let r;
   try {
     if (proveedor() === 'elevenlabs') r = await elevenlabs(limpio, vozId);
+    else if (proveedor() === 'piper') r = await piper(limpio, vozId);
     else r = { error: `Proveedor de voz desconocido: ${proveedor()}` };
   } catch (e) {
     return { error: 'No se pudo contactar el servicio de voz: ' + e.message };

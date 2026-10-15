@@ -268,6 +268,44 @@ class Ami extends EventEmitter {
   }
 
   /**
+   * Llama a un cliente SIN agente, para el blaster.
+   *
+   * Es distinto de `originar`, que llama primero a un agente. Aquí se
+   * marca directamente al cliente y, cuando contesta, la central lo
+   * pasa al contexto `bpm-blaster`, que reproduce el audio y cuelga.
+   *
+   * Se marca a través de un canal Local contra el contexto de salida
+   * normal: así la llamada usa la misma troncal y los mismos prefijos
+   * que cualquier llamada saliente, sin repetir esa configuración aquí.
+   *
+   * No reemplaza a `originar`: el motor de marcación sigue usando la
+   * suya, que ya está probada.
+   */
+  originarBlaster({ numero, audio, digitos = 0, identificador, espera = 40,
+                    contextoSalida = 'from-internal', identificadorLlamada }) {
+    const variables = Object.entries({
+      BPM_AUDIO: audio,
+      BPM_DIGITOS: digitos,
+      BPM_ID: identificador || '',
+    })
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => `${k}=${String(v).replace(/[\r\n,]/g, ' ')}`)
+      .join(',');
+
+    return this.enviar({
+      Action: 'Originate',
+      Channel: `Local/${numero}@${contextoSalida}`,
+      Context: 'bpm-blaster',
+      Exten: 's',
+      Priority: 1,
+      Timeout: espera * 1000,
+      CallerID: identificadorLlamada || '',
+      Async: 'true',
+      Variable: variables,
+    });
+  }
+
+  /**
    * Acciones que responden con una lista. Asterisk contesta primero
    * "Success" y después va mandando un evento por cada elemento, hasta
    * uno final que avisa que terminó. Hay que juntarlos todos.

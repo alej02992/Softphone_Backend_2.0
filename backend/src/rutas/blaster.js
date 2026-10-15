@@ -204,9 +204,9 @@ router.put('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async (re
 
     /* En curso no se toca: cambiar el mensaje a mitad de las llamadas
        dejaría a unos clientes con un mensaje y a otros con otro. */
-    if (['en_curso', 'terminado'].includes(antes.estado)) {
+    if (['activo', 'terminado'].includes(antes.estado)) {
       return res.status(409).json({
-        error: `Un blaster ${antes.estado === 'en_curso' ? 'en curso' : 'terminado'} no se modifica. Pásalo a pausado o crea uno nuevo.` });
+        error: `Un blaster ${antes.estado === 'activo' ? 'en curso' : 'terminado'} no se modifica. Pásalo a pausado o crea uno nuevo.` });
     }
 
     const b = { ...antes, ...req.body, campana_id: antes.campana_id };
@@ -242,7 +242,7 @@ router.delete('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async 
     const no = await puedeCon(req.usuario, b.campana_id);
     if (no) return res.status(403).json({ error: no });
 
-    if (b.estado === 'en_curso') {
+    if (b.estado === 'activo') {
       return res.status(409).json({ error: 'Pausa el blaster antes de cancelarlo' });
     }
 
@@ -268,7 +268,7 @@ router.post('/blasters/:id/destinos', auth.exigirSesion, auth.exigir('blaster'),
       const no = await puedeCon(req.usuario, b.campana_id);
       if (no) return res.status(403).json({ error: no });
 
-      if (b.estado === 'en_curso') {
+      if (b.estado === 'activo') {
         return res.status(409).json({ error: 'Pausa el blaster antes de cambiar su lista' });
       }
 
@@ -450,13 +450,17 @@ router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster_aprob
       if (!b) return res.status(404).json({ error: 'El blaster no existe' });
 
       const nuevo = String(req.body.estado || '');
-      const permitidos = ['aprobado', 'en_curso', 'pausado', 'terminado', 'cancelado'];
+      /* Los nombres deben coincidir con los que admite la base. Antes
+         aquí decía "en_curso", la base solo acepta "activo" y la
+         plataforma mandaba "activo": lanzar un blaster se rechazaba
+         siempre. */
+      const permitidos = ['aprobado', 'activo', 'pausado', 'terminado', 'cancelado'];
       if (!permitidos.includes(nuevo)) {
         return res.status(400).json({ error: 'Estado no válido' });
       }
 
       /* Antes de aprobar se comprueba que esté listo de verdad */
-      if (nuevo === 'aprobado' || nuevo === 'en_curso') {
+      if (nuevo === 'aprobado' || nuevo === 'activo') {
         const n = await bd.una(
           'SELECT COUNT(*) AS n FROM blaster_destinatario WHERE blaster_id = ?', [id]);
         if (!n.n) return res.status(400).json({ error: 'El blaster no tiene destinatarios' });
@@ -476,12 +480,22 @@ router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster_aprob
         }
       }
 
+      /* Al aprobar se marca la casilla `aprobado`. Antes solo cambiaba
+         el estado y la casilla seguía en falso, así que el motor —que
+         exige las dos cosas— nunca habría tomado el blaster.
+
+         Y la fecha de aprobación se conserva al pasar a activo:
+         antes se le asignaba la casilla `aprobado`, un sí/no, y la
+         base rechazaba la consulta con un error interno. */
+      const aprobando = nuevo === 'aprobado' || nuevo === 'activo';
+
       await bd.consultar(
         `UPDATE blaster SET estado = ?,
+                aprobado     = CASE WHEN ? THEN TRUE ELSE aprobado END,
                 aprobado_por = CASE WHEN ? = 'aprobado' THEN ? ELSE aprobado_por END,
-                aprobado_en  = CASE WHEN ? = 'aprobado' THEN NOW() ELSE aprobado END
+                aprobado_en  = CASE WHEN ? = 'aprobado' THEN NOW() ELSE aprobado_en END
           WHERE id = ?`,
-        [nuevo, nuevo, req.usuario.id, nuevo, id]);
+        [nuevo, aprobando, nuevo, req.usuario.id, nuevo, id]);
 
       await auth.auditar(req.usuario.id, 'modificar', 'blaster', id,
         `Pasó el blaster "${b.nombre}" a ${nuevo}`, req.ip);
@@ -554,5 +568,10 @@ router.post('/blasters/:id/respuestas', auth.exigirSesion, async (req, res, next
     res.status(201).json({ ok: true, id: r.insertId });
   } catch (e) { next(e); }
 });
+
+/** El estado del motor: si anda y qué fue lo último que hizo. Sirve
+    para saber por qué un blaster no está llamando. */
+router.get('/blaster/motor', auth.exigirSesion, auth.exigir('blaster'),
+  (req, res) => res.json(require('../blaster-motor').estado()));
 
 module.exports = router;
