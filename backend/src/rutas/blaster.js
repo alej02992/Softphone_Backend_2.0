@@ -90,12 +90,17 @@ router.get('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, r
                  JOIN campana c ON c.id = b.campana_id`;
     const val = [];
 
+    /* Los cancelados no se muestran: al eliminarlos, la persona espera
+       que desaparezcan. Siguen en la base si ya llamaron a alguien, para
+       que el historial no se pierda, pero no estorban en la lista. */
+    const cond = ["b.estado <> 'cancelado'"];
+
     if (mias !== null) {
       if (!mias.length) return res.json([]);
-      sql += ` WHERE b.campana_id IN (${mias.map(() => '?').join(',')})`;
+      cond.push(`b.campana_id IN (${mias.map(() => '?').join(',')})`);
       val.push(...mias);
     }
-    sql += ' ORDER BY b.creado DESC';
+    sql += ' WHERE ' + cond.join(' AND ') + ' ORDER BY b.creado DESC';
 
     res.json(await bd.consultar(sql, val));
   } catch (e) { next(e); }
@@ -246,11 +251,29 @@ router.delete('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async 
       return res.status(409).json({ error: 'Pausa el blaster antes de cancelarlo' });
     }
 
+    /* Si nunca llamó a nadie, no hay historial que proteger: se borra
+       de verdad, con sus destinatarios. Si ya llamó, se cancela y se
+       conserva, porque esas llamadas existieron y pueden consultarse. */
+    const llamo = await bd.una(
+      `SELECT COUNT(*) AS n FROM blaster_destinatario
+        WHERE blaster_id = ? AND (intentos > 0 OR estado <> 'pendiente')`, [id]);
+
+    if (!Number(llamo.n)) {
+      await bd.transaccion(async (cx) => {
+        await cx.execute('DELETE FROM blaster_respuesta WHERE blaster_id = ?', [id]);
+        await cx.execute('DELETE FROM blaster_destinatario WHERE blaster_id = ?', [id]);
+        await cx.execute('DELETE FROM blaster WHERE id = ?', [id]);
+      });
+      await auth.auditar(req.usuario.id, 'eliminar', 'blaster', id,
+        `Eliminó el blaster "${b.nombre}" (nunca había llamado)`, req.ip);
+      return res.json({ ok: true, eliminado: true });
+    }
+
     await bd.consultar("UPDATE blaster SET estado = 'cancelado' WHERE id = ?", [id]);
     await auth.auditar(req.usuario.id, 'eliminar', 'blaster', id,
-      `Canceló el blaster "${b.nombre}"`, req.ip);
+      `Canceló el blaster "${b.nombre}" (se conserva su historial)`, req.ip);
 
-    res.json({ ok: true });
+    res.json({ ok: true, eliminado: false });
   } catch (e) { next(e); }
 });
 
