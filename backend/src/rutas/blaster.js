@@ -431,7 +431,8 @@ router.get('/blasters/:id/destinos', auth.exigirSesion, auth.exigir('blaster'),
       if (no) return res.status(403).json({ error: no });
 
       res.json(await bd.consultar(
-        `SELECT id, numero, nombre, estado, intentos, ultimo_intento, segundos_escuchados
+        `SELECT id, numero, nombre, estado, intentos, ultimo_intento, proximo_intento,
+                ultimo_motivo, segundos_escuchados
            FROM blaster_destinatario WHERE blaster_id = ? ORDER BY id LIMIT 2000`, [id]));
     } catch (e) { next(e); }
   });

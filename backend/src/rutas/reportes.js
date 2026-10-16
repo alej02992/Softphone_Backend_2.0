@@ -451,6 +451,7 @@ router.get('/reportes/blasters/:id', auth.exigirSesion, auth.exigir('reportes'),
          marcó dos veces se muestra la última: es la que vale. */
       const filas = await bd.consultar(
         `SELECT d.id, d.numero, d.nombre, d.estado, d.intentos, d.ultimo_intento,
+                d.ultimo_motivo, d.proximo_intento,
                 (SELECT r.valor FROM blaster_respuesta r
                   WHERE r.destinatario_id = d.id ORDER BY r.id DESC LIMIT 1) AS respuesta,
                 (SELECT r.creada FROM blaster_respuesta r
@@ -512,7 +513,12 @@ router.get('/reportes/blasters/:id', auth.exigirSesion, auth.exigir('reportes'),
         destinatarios: filas.map((f) => ({
           numero: f.numero,
           nombre: f.nombre || '—',
-          estado: ESTADO_DESTINO[f.estado] || f.estado,
+          /* Un "pendiente" que ya se intentó dice cuándo se reintenta y
+             por qué falló. Si no, parece que nunca se llamó. */
+          estado: f.estado === 'pendiente' && f.intentos > 0
+            ? `Reintento ${f.proximo_intento ? hora(f.proximo_intento).slice(0, 5) : 'pendiente'}`
+            : (ESTADO_DESTINO[f.estado] || f.estado),
+          motivo: f.ultimo_motivo || '—',
           intentos: f.intentos || 0,
           ultimaLlamada: f.ultimo_intento
             ? `${fecha(f.ultimo_intento)} ${hora(f.ultimo_intento).slice(0, 5)}` : '—',
@@ -630,7 +636,7 @@ const COLUMNAS = {
   ],
   blaster: [
     ['numero', 'Número'], ['nombre', 'Nombre'], ['estado', 'Estado'],
-    ['intentos', 'Intentos'], ['ultimaLlamada', 'Última llamada'],
+    ['intentos', 'Intentos'], ['ultimaLlamada', 'Última llamada'], ['motivo', 'Motivo'],
     ['respuesta', 'Respuesta'], ['respondio', 'Respondió el'],
   ],
   sesiones: [

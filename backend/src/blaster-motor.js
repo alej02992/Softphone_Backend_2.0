@@ -205,6 +205,24 @@ async function terminarIntento(destinoId, b, contesto) {
      destinoId]);
 }
 
+/**
+ * Lo que significa el código que manda Asterisk cuando una llamada no
+ * se completa. Sin traducirlo, el supervisor solo veía "pendiente" y no
+ * sabía si el número estaba ocupado o si la troncal estaba llena.
+ */
+const MOTIVOS = {
+  0: 'La central no pudo llamar',
+  1: 'Colgó antes de contestar',
+  3: 'No contestó',
+  5: 'Ocupado',
+  8: 'Troncal ocupada o sin canales',
+};
+
+function motivoDe(e) {
+  const codigo = Number(e.Reason);
+  return MOTIVOS[codigo] || (Number.isFinite(codigo) ? `No se completó (código ${codigo})` : 'No se completó');
+}
+
 /** La central avisó qué pasó con una llamada que se ordenó. */
 async function alResponder(e) {
   const destinoId = enVuelo.get(e.ActionID);
@@ -222,6 +240,20 @@ async function alResponder(e) {
      ocupado, número inválido— cuenta como intento fallido. */
   const contesto = e.Response === 'Success';
   await terminarIntento(destinoId, d, contesto);
+
+  /* El motivo se guarda siempre que falla: es lo que el supervisor
+     necesita para saber si reintentar sirve de algo. Un número que no
+     existe no va a contestar por mucho que se reintente. */
+  if (!contesto) {
+    const motivo = motivoDe(e);
+    await bd.consultar(
+      'UPDATE blaster_destinatario SET ultimo_motivo = ? WHERE id = ?', [motivo, destinoId]);
+    const fila = await bd.una('SELECT numero FROM blaster_destinatario WHERE id = ?', [destinoId]);
+    anotar(`${fila?.numero || 'Destinatario ' + destinoId}: ${motivo}`);
+  } else {
+    await bd.consultar(
+      'UPDATE blaster_destinatario SET ultimo_motivo = NULL WHERE id = ?', [destinoId]);
+  }
 }
 
 /* ═══════════ LA RESPUESTA DEL CLIENTE ═══════════
