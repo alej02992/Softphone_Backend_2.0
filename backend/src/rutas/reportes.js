@@ -409,11 +409,17 @@ router.get('/reportes/blasters', auth.exigirSesion, auth.exigir('reportes'),
                    FROM blaster b LEFT JOIN campana c ON c.id = b.campana_id`;
       const val = [];
 
+      /* Los cancelados no se listan: igual que en la pantalla de
+         Blaster, quien cancela uno espera que desaparezca. Su historial
+         sigue en la base. */
+      const cond = ["b.estado <> 'cancelado'"];
+
       if (mias !== null) {
         if (!mias.length) return res.json([]);
-        sql += ` WHERE b.campana_id IN (${mias.map(() => '?').join(',')})`;
+        cond.push(`b.campana_id IN (${mias.map(() => '?').join(',')})`);
         val.push(...mias);
       }
+      sql += ' WHERE ' + cond.join(' AND ');
       sql += ' ORDER BY b.creado DESC';
 
       res.json(await bd.consultar(sql, val));
