@@ -493,12 +493,38 @@ router.get('/reportes/blasters/:id', auth.exigirSesion, auth.exigir('reportes'),
           cuenta.set(f.respuesta, (cuenta.get(f.respuesta) || 0) + 1);
         });
       }
+      /* Los porcentajes se calculan sobre TODA la lista, no solo sobre
+         los que respondieron. Antes, si de 5 personas respondían 3 y las
+         3 decían que sí, la barra marcaba 100%: cierto sobre los que
+         respondieron, pero engañoso, porque parecía que todos estaban de
+         acuerdo. Ahora aparecen también los que no respondieron, y las
+         barras suman el 100% real de la lista. */
+      const total = filas.length;
+      const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
+
       const reparto = [...cuenta.entries()]
-        .map(([valor, n]) => ({
-          valor: nombreDe(valor), cantidad: n,
-          porcentaje: respondieron ? Math.round((n / respondieron) * 1000) / 10 : 0,
-        }))
+        .map(([valor, n]) => ({ valor: nombreDe(valor), cantidad: n, porcentaje: pct(n) }))
         .sort((a, z) => z.cantidad - a.cantidad);
+
+      /* Los que no respondieron, separados por motivo: no es lo mismo
+         alguien que contestó y no marcó que alguien que ni contestó. */
+      const invalidas = filas.filter((f) => /^invalida:/.test(f.respuesta || '')).length;
+      const sinMarcar = filas.filter((f) =>
+        f.estado === 'contestada' && (!f.respuesta)).length;
+      const noContesto = filas.filter((f) =>
+        ['sin_respuesta', 'fallida', 'buzon'].includes(f.estado)).length;
+      const porLlamar = filas.filter((f) =>
+        ['pendiente', 'llamando'].includes(f.estado)).length;
+
+      if (!esNumero) {
+        [['Marcó una tecla no válida', invalidas],
+         ['Contestó pero no marcó', sinMarcar],
+         ['No contestó', noContesto],
+         ['Por llamar', porLlamar]]
+          .forEach(([nombre, n]) => {
+            if (n) reparto.push({ valor: nombre, cantidad: n, porcentaje: pct(n), sinRespuesta: true });
+          });
+      }
 
       res.json({
         blaster: b.nombre,
@@ -513,8 +539,9 @@ router.get('/reportes/blasters/:id', auth.exigirSesion, auth.exigir('reportes'),
           tasaRespuesta: contestaron ? Math.round((respondieron / contestaron) * 1000) / 10 : 0,
         },
         tipoRespuesta: b.respuesta ? b.respuesta_tipo : null,
-        reparto: b.respuesta && reparto.length
-          ? [{ etiqueta: 'Respuestas', total: respondieron, opciones: reparto }]
+        /* El total del grupo es toda la lista: así las barras suman 100% */
+        reparto: b.respuesta && reparto.length && cuenta.size
+          ? [{ etiqueta: 'Resultado sobre toda la lista', total, opciones: reparto }]
           : [],
         destinatarios: filas.map((f) => ({
           numero: f.numero,
@@ -818,7 +845,8 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
             if (!opciones.length) return;
 
             doc.fontSize(8).fillColor('#002E44')
-               .text(`${grupo.etiqueta || 'Resultados'} · ${grupo.total ?? ''} respuestas`, 30, y);
+               .text(`${grupo.etiqueta || 'Resultados'} · ${grupo.total ?? ''} ${
+                 /lista/i.test(grupo.etiqueta || '') ? 'personas' : 'respuestas'}`, 30, y);
             y += 13;
 
             const anchoNombre = 170, anchoBarra = ancho - anchoNombre - 90;
@@ -829,7 +857,7 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
               doc.roundedRect(30 + anchoNombre, y + 2, anchoBarra, 7, 3).fillColor('#E8EDF0').fill();
               if (pct > 0) {
                 doc.roundedRect(30 + anchoNombre, y + 2, Math.max(4, anchoBarra * pct / 100), 7, 3)
-                   .fillColor('#00A0D6').fill();
+                   .fillColor(o.sinRespuesta ? '#A9B4BC' : '#00A0D6').fill();
               }
               doc.fontSize(7.5).fillColor('#5A6670')
                  .text(`${o.cantidad ?? ''}  ·  ${pct}%`, 30 + anchoNombre + anchoBarra + 8, y + 1,
