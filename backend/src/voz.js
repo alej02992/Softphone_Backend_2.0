@@ -381,8 +381,27 @@ function aTelefono(audio) {
  * Genera el audio de un texto y devuelve el nombre del archivo.
  * Nunca lanza: devuelve `{ error }` para que quien llame decida.
  */
+/**
+ * Deja el texto como lo necesita una voz sintética.
+ *
+ * Sin un punto al final, algunos motores —sobre todo Piper en sus voces
+ * de calidad baja— no saben dónde termina la frase y siguen produciendo
+ * sonidos sin sentido, como un balbuceo. Los saltos de línea y los
+ * espacios repetidos causan pausas raras.
+ */
+function prepararTexto(texto) {
+  let t = String(texto || '')
+    .replace(/[\r\n\t]+/g, ' ')        // saltos de línea → espacio
+    .replace(/\s{2,}/g, ' ')             // espacios repetidos
+    .trim();
+
+  /* Termina siempre en un signo: punto si no trae ninguno */
+  if (t && !/[.!?…]$/.test(t)) t += '.';
+  return t;
+}
+
 async function generar(texto, vozId, base = 'blaster') {
-  const limpio = String(texto || '').trim();
+  const limpio = prepararTexto(texto);
   if (limpio.length < 3) return { error: 'El texto es demasiado corto' };
   if (limpio.length > 2500) {
     return { error: 'El texto supera los 2.500 caracteres. Divídelo en mensajes más cortos.' };
