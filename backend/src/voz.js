@@ -33,8 +33,12 @@ const CONFIG = require('./config');
    de montar la marcación. */
 const CARPETA = (CONFIG.tts && CONFIG.tts.carpeta) || '/var/lib/asterisk/sounds/blaster';
 
-const proveedor = () => (CONFIG.tts && CONFIG.tts.proveedor) || 'ninguno';
-const clave = () => (CONFIG.tts && CONFIG.tts.clave) || '';
+/* Se toleran mayúsculas y espacios: "TextToSpeechAI " en el .env debe
+   funcionar igual que "texttospeechai". Antes no, y el error decía
+   solo que no había servicio configurado. */
+const proveedor = () =>
+  String((CONFIG.tts && CONFIG.tts.proveedor) || 'ninguno').trim().toLowerCase();
+const clave = () => String((CONFIG.tts && CONFIG.tts.clave) || '').trim();
 
 /** Hay servicio de voz configurado. Piper corre en el propio servidor
     y no lleva credencial; los servicios en la nube sí la necesitan. */
@@ -386,5 +390,19 @@ function paraEscuchar(archivo) {
   });
 }
 
+/** Qué falta para que el servicio de voz funcione, dicho en claro.
+    Nunca muestra la clave: solo si está o no. */
+function diagnostico() {
+  const p = proveedor();
+  if (p === 'ninguno') return 'Falta TTS_PROVEEDOR en el .env del servidor';
+  if (!PROVEEDORES[p]) {
+    return `TTS_PROVEEDOR dice "${p}", que no es un proveedor conocido. ` +
+           `Opciones: ${Object.keys(PROVEEDORES).join(', ')}`;
+  }
+  if (PROVEEDORES[p].necesitaClave && !clave()) return `Falta TTS_CLAVE para ${p}`;
+  return null;
+}
+
 module.exports = {
+  diagnostico,
   paraEscuchar, generar, disponible, proveedor, armarNombre: nombreDe, CARPETA };

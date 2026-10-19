@@ -459,7 +459,8 @@ router.post('/blasters/:id/audio', auth.exigirSesion, auth.exigir('blaster'),
       }
       if (!voz.disponible()) {
         return res.status(503).json({
-          error: 'No hay servicio de voz configurado. Revisa TTS_PROVEEDOR y TTS_CLAVE en el servidor.',
+          /* El mensaje dice exactamente qué falta, en vez de un genérico */
+          error: 'No hay servicio de voz configurado. ' + (voz.diagnostico() || ''),
           proveedor: voz.proveedor(),
         });
       }
