@@ -179,11 +179,20 @@ async function google(texto, vozId) {
   return { audio: Buffer.from(datos.audioContent, 'base64'), formato: 'contenedor' };
 }
 
-/* TEXTTOSPEECHAI (Piper en la nube)
+/* ═══════════ TEXTTOSPEECHAI (Piper en la nube) ═══════════
 
    Servicio que ofrece Piper —y otros motores— por una API, sin
    instalar nada en el servidor. Se usa para pruebas: es muy barato
-   y solo publica voces cuyo entrenamiento permite el uso comercial. */
+   y solo publica voces cuyo entrenamiento permite el uso comercial.
+
+   POST https://api.texttospeechai.com/v1/generate/
+   Authorization: Bearer <clave>
+   { "text": "...", "voice": "es_ES-carlfm-x_low" }
+
+   Su documentación dice que devuelve una dirección para descargar el
+   audio. Como no se pudo confirmar el nombre exacto del campo, se
+   aceptan las formas habituales: el audio directo, una dirección de
+   descarga, el audio en base64, o un trabajo que hay que esperar.     */
 
 const TTSAI_URL = 'https://api.texttospeechai.com/v1/generate/';
 
@@ -214,7 +223,9 @@ function buscarBase64(d) {
 }
 
 async function texttospeechai(texto, vozId) {
-  const voz = vozId || CONFIG.tts.vozPorDefecto;
+  /* Recortada: un salto de línea de Windows al final del .env la
+     convertía en otro nombre, y el servicio respondía "voice not found". */
+  const voz = String(vozId || CONFIG.tts.vozPorDefecto || '').trim();
   if (!voz) return { error: 'Falta indicar la voz (TTS_VOZ en el servidor), por ejemplo es_ES-carlfm-x_low' };
 
   const cabeceras = { Authorization: `Bearer ${clave()}`, 'Content-Type': 'application/json' };
@@ -227,7 +238,10 @@ async function texttospeechai(texto, vozId) {
 
   if (!r.ok) {
     const detalle = await r.text().catch(() => '');
-    return { error: `TextToSpeechAI respondió ${r.status}. ${detalle.slice(0, 200)}` };
+    /* Los códigos que documenta su servicio, dichos en claro */
+    const que = { 401: 'la clave no es válida', 402: 'no quedan créditos en la cuenta',
+                  404: 'no encontró la voz o el recurso', 429: 'se llegó al límite de peticiones del día' }[r.status];
+    return { error: `TextToSpeechAI respondió ${r.status}${que ? ' (' + que + ')' : ''}. ${detalle.slice(0, 200)}` };
   }
 
   /* Si devuelve el audio directamente, ya está */
@@ -238,22 +252,27 @@ async function texttospeechai(texto, vozId) {
 
   let datos = await r.json();
 
-  /* Si es un trabajo que hay que esperar, se consulta hasta que esté.
-     Hasta 30 segundos: un mensaje de blaster se genera en uno o dos. */
-  const consulta = datos.status_url || datos.poll_url ||
-    (datos.id && /pend|queue|process|running/i.test(String(datos.status || ''))
-      ? `${TTSAI_URL.replace(/generate\/$/, '')}generations/${datos.id}/` : null);
+  /* Su servicio trabaja por pedidos: responde con un `uuid` y estado
+     "pending", y hay que consultar /v1/status/{uuid}/ hasta que diga
+     "completed" con la dirección del audio. Así lo indica su
+     documentación. Piper suele tardar uno o dos segundos. */
+  if (datos.uuid && !buscarUrl(datos) && !buscarBase64(datos)) {
+    const consulta = `https://api.texttospeechai.com/v1/status/${encodeURIComponent(datos.uuid)}/`;
 
-  if (consulta && !buscarUrl(datos) && !buscarBase64(datos)) {
     for (let i = 0; i < 30; i++) {
-      await new Promise((res) => setTimeout(res, 1000));
-      const s = await fetch(consulta, { headers: cabeceras });
+      await new Promise((res) => setTimeout(res, 1500));
+      const s = await fetch(consulta, { headers: { Authorization: `Bearer ${clave()}` } });
       if (!s.ok) continue;
       datos = await s.json();
-      if (/fail|error/i.test(String(datos.status || ''))) {
-        return { error: 'TextToSpeechAI no pudo generar el audio: ' + (datos.error || datos.status) };
+
+      if (datos.status === 'failed') {
+        return { error: 'TextToSpeechAI no pudo generar el audio: ' + (datos.error || 'sin detalle') };
       }
-      if (buscarUrl(datos) || buscarBase64(datos)) break;
+      if (datos.status === 'completed') break;
+    }
+
+    if (datos.status !== 'completed') {
+      return { error: 'TextToSpeechAI tardó demasiado en generar el audio. Inténtalo de nuevo.' };
     }
   }
 
