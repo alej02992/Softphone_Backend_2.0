@@ -201,7 +201,13 @@ function buscarUrl(d) {
   if (!d || typeof d !== 'object') return null;
   const campos = ['audio_url', 'url', 'download_url', 'file_url', 'audio', 'output_url', 'result_url'];
   for (const c of campos) {
-    if (typeof d[c] === 'string' && /^https?:\/\//.test(d[c])) return d[c];
+    if (typeof d[c] !== 'string') continue;
+    if (/^https?:\/\//.test(d[c])) return d[c];
+
+    /* Su documentación dice que la dirección viene completa, pero en
+       la práctica llega a medias: "/uploads/generations/...". Se le
+       pone delante la dirección de su sitio. */
+    if (d[c].startsWith('/uploads/')) return 'https://texttospeechai.com' + d[c];
   }
   for (const anidado of ['data', 'result', 'output', 'generation']) {
     const u = buscarUrl(d[anidado]);
@@ -222,7 +228,38 @@ function buscarBase64(d) {
   return null;
 }
 
-async function texttospeechai(texto, vozId) {
+/* Lo que ya se pagó y no se alcanzó a bajar. Si la descarga falla, el
+   reintento baja el mismo audio en vez de pedir —y pagar— uno nuevo. */
+const PAGADOS = () => path.join(CARPETA, 'pagados-ttsai.json');
+
+function leerPagados() {
+  try { return JSON.parse(fs.readFileSync(PAGADOS(), 'utf8')); } catch { return {}; }
+}
+function anotarPagado(huella, url) {
+  const p = leerPagados();
+  if (url) p[huella] = url; else delete p[huella];
+  try { fs.writeFileSync(PAGADOS(), JSON.stringify(p)); } catch { /* no es grave */ }
+}
+
+async function bajar(url) {
+  const a = await fetch(url, { headers: { Authorization: `Bearer ${clave()}` } });
+  if (!a.ok) return null;
+  return Buffer.from(await a.arrayBuffer());
+}
+
+async function texttospeechai(texto, vozId, huella) {
+  /* ¿Ya se pagó este audio y faltó bajarlo? */
+  const previa = huella && leerPagados()[huella];
+  if (previa) {
+    const audio = await bajar(previa);
+    if (audio && audio.length > 500) {
+      anotarPagado(huella, null);
+      return { audio, formato: 'contenedor' };
+    }
+    /* El enlace ya no sirve: se pide de nuevo */
+    anotarPagado(huella, null);
+  }
+
   /* Recortada: un salto de línea de Windows al final del .env la
      convertía en otro nombre, y el servicio respondía "voice not found". */
   const voz = String(vozId || CONFIG.tts.vozPorDefecto || '').trim();
@@ -259,8 +296,11 @@ async function texttospeechai(texto, vozId) {
   if (datos.uuid && !buscarUrl(datos) && !buscarBase64(datos)) {
     const consulta = `https://api.texttospeechai.com/v1/status/${encodeURIComponent(datos.uuid)}/`;
 
-    for (let i = 0; i < 30; i++) {
-      await new Promise((res) => setTimeout(res, 1500));
+    /* Cada 2 segundos, como indica su documentación. Las consultas
+       cuentan en el límite diario de peticiones, así que no se pregunta
+       más de lo necesario: Piper tarda uno o dos segundos. */
+    for (let i = 0; i < 15; i++) {
+      await new Promise((res) => setTimeout(res, 2000));
       const s = await fetch(consulta, { headers: { Authorization: `Bearer ${clave()}` } });
       if (!s.ok) continue;
       datos = await s.json();
@@ -285,12 +325,18 @@ async function texttospeechai(texto, vozId) {
                     JSON.stringify(datos).slice(0, 200) };
   }
 
-  /* Se descarga. Se manda la clave por si el enlace la pide; si es un
-     enlace público, simplemente la ignora. */
-  const a = await fetch(url, { headers: { Authorization: `Bearer ${clave()}` } });
-  if (!a.ok) return { error: `No se pudo descargar el audio (${a.status})` };
+  /* Se anota ANTES de bajarlo: ya está pagado. Si la descarga falla,
+     el próximo intento lo baja sin volver a cobrar. */
+  if (huella) anotarPagado(huella, url);
 
-  return { audio: Buffer.from(await a.arrayBuffer()), formato: 'contenedor' };
+  const audio = await bajar(url);
+  if (!audio || audio.length < 500) {
+    return { error: 'El audio se generó pero no se pudo descargar. ' +
+                    'Vuelve a intentarlo: no se cobrará de nuevo.' };
+  }
+
+  if (huella) anotarPagado(huella, null);
+  return { audio, formato: 'contenedor' };
 }
 
 /* ═══════════ LOS PROVEEDORES ═══════════
@@ -306,7 +352,7 @@ const PROVEEDORES = {
   elevenlabs: { funcion: (t, v) => elevenlabs(t, v), necesitaClave: true },
   piper:      { funcion: (t, v) => piper(t, v),      necesitaClave: false },
   google:     { funcion: (t, v) => google(t, v),     necesitaClave: true },
-  texttospeechai: { funcion: (t, v) => texttospeechai(t, v), necesitaClave: true },
+  texttospeechai: { funcion: (t, v, h) => texttospeechai(t, v, h), necesitaClave: true },
 };
 
 /**
@@ -350,24 +396,41 @@ async function generar(texto, vozId, base = 'blaster') {
 
   await asegurarCarpeta();
 
-  /* Todos los audios se guardan igual, sea cual sea el proveedor:
-     μ-law a 8 kHz, con extensión .ulaw. Asterisk decide cómo leer el
-     archivo por la extensión, así que tiene que coincidir. */
-  const archivo = nombreDe(base, limpio, `${proveedor()}|${vozId || ''}`).replace(/\.mp3$/, '.ulaw');
-  const ruta = path.join(CARPETA, archivo);
+  /* Cada audio se identifica por LO QUE DICE: el texto, el proveedor y
+     la voz que de verdad se usa. Antes el nombre dependía de para qué
+     era —"muestra", "blaster 12"—, y el mismo texto se pagaba dos veces:
+     al escucharlo y al generarlo. Y si se cambiaba la voz en el .env, se
+     reutilizaba el audio con la voz anterior.
 
-  /* Si ya se generó ese mismo texto, se reutiliza: los servicios en la
-     nube cobran por carácter. */
+     Así, el mismo mensaje con la misma voz se genera UNA vez, y lo
+     reutilizan la muestra, el definitivo y cualquier otro blaster. */
+  const vozEfectiva = String(vozId || CONFIG.tts.vozPorDefecto || '').trim();
+  const huella = crypto.createHash('sha1')
+    .update(`${proveedor()}|${vozEfectiva}|${limpio}`).digest('hex').slice(0, 16);
+  const archivo = `voz-${huella}.ulaw`;
+  const ruta = path.join(CARPETA, archivo);
+  const rutaCruda = path.join(CARPETA, `voz-${huella}.crudo`);
+
   if (fs.existsSync(ruta)) return { archivo, reutilizado: true };
 
   let r;
-  try {
-    r = await p.funcion(limpio, vozId);
-  } catch (e) {
-    return { error: 'No se pudo contactar el servicio de voz: ' + e.message };
-  }
 
-  if (r.error) return { error: r.error };
+  /* Si un intento anterior ya pagó y bajó el audio, pero falló al
+     convertirlo, se usa lo bajado: no se paga otra vez. */
+  if (fs.existsSync(rutaCruda)) {
+    r = { audio: await fsp.readFile(rutaCruda), formato: 'contenedor' };
+  } else {
+    try {
+      r = await p.funcion(limpio, vozId, huella);
+    } catch (e) {
+      return { error: 'No se pudo contactar el servicio de voz: ' + e.message };
+    }
+    if (r.error) return { error: r.error };
+
+    /* Lo pagado se guarda tal cual, ANTES de convertirlo. Si lo que
+       sigue falla, el reintento no vuelve a cobrar. */
+    if (r.formato !== 'ulaw') await fsp.writeFile(rutaCruda, r.audio).catch(() => {});
+  }
 
   /* Lo que no venga ya en formato telefónico, se convierte */
   if (r.formato !== 'ulaw') {
@@ -382,6 +445,7 @@ async function generar(texto, vozId, base = 'blaster') {
     return { error: 'No se pudo guardar el audio: ' + e.message };
   }
 
+  await fsp.unlink(rutaCruda).catch(() => {});
   return { archivo, bytes: r.audio.length };
 }
 
