@@ -175,6 +175,101 @@ async function google(texto, vozId) {
   return { audio: Buffer.from(datos.audioContent, 'base64'), formato: 'contenedor' };
 }
 
+/* TEXTTOSPEECHAI (Piper en la nube)
+
+   Servicio que ofrece Piper —y otros motores— por una API, sin
+   instalar nada en el servidor. Se usa para pruebas: es muy barato
+   y solo publica voces cuyo entrenamiento permite el uso comercial. */
+
+const TTSAI_URL = 'https://api.texttospeechai.com/v1/generate/';
+
+/** Busca en la respuesta la dirección del audio, se llame como se llame. */
+function buscarUrl(d) {
+  if (!d || typeof d !== 'object') return null;
+  const campos = ['audio_url', 'url', 'download_url', 'file_url', 'audio', 'output_url', 'result_url'];
+  for (const c of campos) {
+    if (typeof d[c] === 'string' && /^https?:\/\//.test(d[c])) return d[c];
+  }
+  for (const anidado of ['data', 'result', 'output', 'generation']) {
+    const u = buscarUrl(d[anidado]);
+    if (u) return u;
+  }
+  return null;
+}
+
+function buscarBase64(d) {
+  if (!d || typeof d !== 'object') return null;
+  for (const c of ['audio_base64', 'audio_content', 'audioContent', 'content']) {
+    if (typeof d[c] === 'string' && d[c].length > 100 && !/^https?:/.test(d[c])) return d[c];
+  }
+  for (const anidado of ['data', 'result', 'output']) {
+    const b = buscarBase64(d[anidado]);
+    if (b) return b;
+  }
+  return null;
+}
+
+async function texttospeechai(texto, vozId) {
+  const voz = vozId || CONFIG.tts.vozPorDefecto;
+  if (!voz) return { error: 'Falta indicar la voz (TTS_VOZ en el servidor), por ejemplo es_ES-carlfm-x_low' };
+
+  const cabeceras = { Authorization: `Bearer ${clave()}`, 'Content-Type': 'application/json' };
+
+  const r = await fetch(TTSAI_URL, {
+    method: 'POST',
+    headers: cabeceras,
+    body: JSON.stringify({ text: texto, voice: voz, format: 'wav' }),
+  });
+
+  if (!r.ok) {
+    const detalle = await r.text().catch(() => '');
+    return { error: `TextToSpeechAI respondió ${r.status}. ${detalle.slice(0, 200)}` };
+  }
+
+  /* Si devuelve el audio directamente, ya está */
+  const tipo = r.headers.get('content-type') || '';
+  if (/audio|octet-stream/.test(tipo)) {
+    return { audio: Buffer.from(await r.arrayBuffer()), formato: 'contenedor' };
+  }
+
+  let datos = await r.json();
+
+  /* Si es un trabajo que hay que esperar, se consulta hasta que esté.
+     Hasta 30 segundos: un mensaje de blaster se genera en uno o dos. */
+  const consulta = datos.status_url || datos.poll_url ||
+    (datos.id && /pend|queue|process|running/i.test(String(datos.status || ''))
+      ? `${TTSAI_URL.replace(/generate\/$/, '')}generations/${datos.id}/` : null);
+
+  if (consulta && !buscarUrl(datos) && !buscarBase64(datos)) {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, 1000));
+      const s = await fetch(consulta, { headers: cabeceras });
+      if (!s.ok) continue;
+      datos = await s.json();
+      if (/fail|error/i.test(String(datos.status || ''))) {
+        return { error: 'TextToSpeechAI no pudo generar el audio: ' + (datos.error || datos.status) };
+      }
+      if (buscarUrl(datos) || buscarBase64(datos)) break;
+    }
+  }
+
+  const b64 = buscarBase64(datos);
+  if (b64) return { audio: Buffer.from(b64, 'base64'), formato: 'contenedor' };
+
+  const url = buscarUrl(datos);
+  if (!url) {
+    return { error: 'TextToSpeechAI respondió sin audio. Respuesta: ' +
+                    JSON.stringify(datos).slice(0, 200) };
+  }
+
+  /* Se descarga. Se manda la clave por si el enlace la pide; si es un
+     enlace público, simplemente la ignora. */
+  const a = await fetch(url, { headers: { Authorization: `Bearer ${clave()}` } });
+  if (!a.ok) return { error: `No se pudo descargar el audio (${a.status})` };
+
+  return { audio: Buffer.from(await a.arrayBuffer()), formato: 'contenedor' };
+}
+
 /* ═══════════ LOS PROVEEDORES ═══════════
 
    Para agregar otro servicio: escribir su función —recibe el texto y la
@@ -188,6 +283,7 @@ const PROVEEDORES = {
   elevenlabs: { funcion: (t, v) => elevenlabs(t, v), necesitaClave: true },
   piper:      { funcion: (t, v) => piper(t, v),      necesitaClave: false },
   google:     { funcion: (t, v) => google(t, v),     necesitaClave: true },
+  texttospeechai: { funcion: (t, v) => texttospeechai(t, v), necesitaClave: true },
 };
 
 /**
