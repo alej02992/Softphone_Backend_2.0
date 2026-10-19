@@ -610,8 +610,14 @@ router.get('/blasters/:id/respuestas', auth.exigirSesion, auth.exigir('blaster')
       const no = await puedeCon(req.usuario, b.campana_id);
       if (no) return res.status(403).json({ error: no });
 
+      /* Los nombres de los campos son los que usa la pantalla: `valor` y
+         `creada`. Antes se mandaban como `respuesta` y `recibida`, y la
+         tabla de respuestas del editor salía con esas columnas vacías.
+
+         El nombre sale de su columna; si no está, de los datos extra. */
       const filas = await bd.consultar(
-        `SELECT r.id, r.numero, r.valor AS respuesta, r.creada AS recibida, JSON_UNQUOTE(JSON_EXTRACT(d.datos, '$.nombre')) AS nombre
+        `SELECT r.id, r.numero, r.valor, r.creada,
+                COALESCE(d.nombre, JSON_UNQUOTE(JSON_EXTRACT(d.datos, '$.nombre'))) AS nombre
            FROM blaster_respuesta r
            LEFT JOIN blaster_destinatario d ON d.id = r.destinatario_id
           WHERE r.blaster_id = ?
@@ -620,7 +626,7 @@ router.get('/blasters/:id/respuestas', auth.exigirSesion, auth.exigir('blaster')
 
       /* Cuántos marcaron cada opción: es lo primero que se mira */
       const conteo = {};
-      filas.forEach((f) => { conteo[f.respuesta] = (conteo[f.respuesta] || 0) + 1; });
+      filas.forEach((f) => { conteo[f.valor] = (conteo[f.valor] || 0) + 1; });
 
       res.json({ total: filas.length, tipo: b.respuesta_tipo, conteo, respuestas: filas });
     } catch (e) { next(e); }

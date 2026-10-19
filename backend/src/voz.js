@@ -39,10 +39,9 @@ const clave = () => (CONFIG.tts && CONFIG.tts.clave) || '';
 /** Hay servicio de voz configurado. Piper corre en el propio servidor
     y no lleva credencial; los servicios en la nube sí la necesitan. */
 const disponible = () => {
-  const p = proveedor();
-  if (p === 'ninguno') return false;
-  if (p === 'piper') return true;
-  return !!clave();
+  const p = PROVEEDORES[proveedor()];
+  if (!p) return false;
+  return p.necesitaClave ? !!clave() : true;
 };
 
 async function asegurarCarpeta() {
@@ -88,7 +87,7 @@ async function elevenlabs(texto, vozId) {
     try { detalle = JSON.stringify(await r.json()).slice(0, 200); } catch { /* sin cuerpo */ }
     return { error: `El servicio de voz respondió ${r.status}. ${detalle}` };
   }
-  return { audio: Buffer.from(await r.arrayBuffer()) };
+  return { audio: Buffer.from(await r.arrayBuffer()), formato: 'ulaw' };
 }
 
 /* ═══════════ PIPER ═══════════
@@ -128,7 +127,7 @@ function piper(texto, vozId) {
       try {
         const audio = await fsp.readFile(salida);
         await fsp.unlink(salida).catch(() => {});
-        resolve({ audio, extension: '.wav' });
+        resolve({ audio, formato: 'contenedor' });
       } catch (e) {
         resolve({ error: 'Piper no dejó el archivo: ' + e.message });
       }
@@ -136,6 +135,78 @@ function piper(texto, vozId) {
 
     proc.stdin.write(texto);
     proc.stdin.end();
+  });
+}
+
+/* ═══════════ GOOGLE CLOUD TEXT-TO-SPEECH ═══════════
+
+   Se pide en LINEAR16 a 8 kHz, que llega como un wav. Después pasa por
+   la misma conversión que todos, así que no importa el formato exacto
+   que devuelva Google.
+
+   TTS_VOZ es el nombre de la voz, por ejemplo "es-US-Neural2-A".
+   TTS_IDIOMA es el idioma, por defecto "es-US".                       */
+
+async function google(texto, vozId) {
+  const voz = vozId || CONFIG.tts.vozPorDefecto;
+  const idioma = CONFIG.tts.idioma || 'es-US';
+
+  const url = 'https://texttospeech.googleapis.com/v1/text:synthesize?key=' +
+              encodeURIComponent(clave());
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      input: { text: texto },
+      voice: voz ? { languageCode: idioma, name: voz } : { languageCode: idioma },
+      audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 8000 },
+    }),
+  });
+
+  if (!r.ok) {
+    const detalle = await r.text().catch(() => '');
+    return { error: `Google respondió ${r.status}. ${detalle.slice(0, 200)}` };
+  }
+
+  const datos = await r.json();
+  if (!datos.audioContent) return { error: 'Google no devolvió audio' };
+
+  return { audio: Buffer.from(datos.audioContent, 'base64'), formato: 'contenedor' };
+}
+
+/* ═══════════ LOS PROVEEDORES ═══════════
+
+   Para agregar otro servicio: escribir su función —recibe el texto y la
+   voz, devuelve { audio, formato }— y añadirlo aquí. Nada más cambia:
+   el formato telefónico lo resuelve `aTelefono` para todos.
+
+   formato 'ulaw'        el audio ya viene listo para el teléfono
+   formato 'contenedor'  wav, mp3 u otro: se convierte                   */
+
+const PROVEEDORES = {
+  elevenlabs: { funcion: (t, v) => elevenlabs(t, v), necesitaClave: true },
+  piper:      { funcion: (t, v) => piper(t, v),      necesitaClave: false },
+  google:     { funcion: (t, v) => google(t, v),     necesitaClave: true },
+};
+
+/**
+ * Deja cualquier audio en el formato del teléfono: μ-law a 8 kHz, mono.
+ *
+ * Es lo que reproduce Asterisk sin convertir. Antes cada proveedor
+ * guardaba en su formato, y Piper —que entrega wav a 22 kHz— salía en
+ * silencio en la llamada.
+ */
+function aTelefono(audio) {
+  const { execFile } = require('child_process');
+  return new Promise((resolver) => {
+    const proc = execFile('ffmpeg',
+      ['-v', 'error', '-i', 'pipe:0', '-ar', '8000', '-ac', '1', '-f', 'mulaw', 'pipe:1'],
+      { encoding: 'buffer', maxBuffer: 30 * 1024 * 1024, timeout: 30000 },
+      (err, salida) => resolver(err || !salida?.length
+        ? { error: 'No se pudo convertir el audio al formato del teléfono. ¿Está instalado ffmpeg?' }
+        : { audio: salida }));
+    proc.stdin.end(audio);
   });
 }
 
@@ -155,27 +226,36 @@ async function generar(texto, vozId, base = 'blaster') {
     return { error: 'No hay servicio de voz configurado' };
   }
 
+  const p = PROVEEDORES[proveedor()];
+  if (!p) return { error: `Proveedor de voz desconocido: ${proveedor()}` };
+
   await asegurarCarpeta();
-  /* Cada proveedor entrega un formato distinto: ElevenLabs μ-law y
-     Piper wav. Asterisk reproduce los dos sin convertir. La extensión
-     importa: Asterisk decide cómo leer el archivo por ella. */
-  const extension = proveedor() === 'piper' ? '.wav' : '.ulaw';
-  const archivo = nombreDe(base, limpio, vozId).replace(/\.mp3$/, extension);
+
+  /* Todos los audios se guardan igual, sea cual sea el proveedor:
+     μ-law a 8 kHz, con extensión .ulaw. Asterisk decide cómo leer el
+     archivo por la extensión, así que tiene que coincidir. */
+  const archivo = nombreDe(base, limpio, `${proveedor()}|${vozId || ''}`).replace(/\.mp3$/, '.ulaw');
   const ruta = path.join(CARPETA, archivo);
 
-  /* Si ya se generó ese mismo texto, se reutiliza */
+  /* Si ya se generó ese mismo texto, se reutiliza: los servicios en la
+     nube cobran por carácter. */
   if (fs.existsSync(ruta)) return { archivo, reutilizado: true };
 
   let r;
   try {
-    if (proveedor() === 'elevenlabs') r = await elevenlabs(limpio, vozId);
-    else if (proveedor() === 'piper') r = await piper(limpio, vozId);
-    else r = { error: `Proveedor de voz desconocido: ${proveedor()}` };
+    r = await p.funcion(limpio, vozId);
   } catch (e) {
     return { error: 'No se pudo contactar el servicio de voz: ' + e.message };
   }
 
   if (r.error) return { error: r.error };
+
+  /* Lo que no venga ya en formato telefónico, se convierte */
+  if (r.formato !== 'ulaw') {
+    const c = await aTelefono(r.audio);
+    if (c.error) return { error: c.error };
+    r = { audio: c.audio };
+  }
 
   try {
     await fsp.writeFile(ruta, r.audio);

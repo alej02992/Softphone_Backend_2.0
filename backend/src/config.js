@@ -58,6 +58,7 @@ const CONFIG = {
     clave:         process.env.TTS_CLAVE || '',
     vozPorDefecto: process.env.TTS_VOZ || '',
     modelo:        process.env.TTS_MODELO || 'eleven_multilingual_v2',
+    idioma:        process.env.TTS_IDIOMA || 'es-US',
     carpeta:       process.env.TTS_CARPETA || '/var/lib/asterisk/sounds/blaster',
     /* Ruta del programa Piper cuando TTS_PROVEEDOR=piper */
     piper:         process.env.TTS_PIPER || 'piper',
