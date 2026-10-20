@@ -424,16 +424,67 @@ router.get('/blasters/:id/destinos', auth.exigirSesion, auth.exigir('blaster'),
   async (req, res, next) => {
     try {
       const id = Number(req.params.id);
+      const b = await bd.una(
+        'SELECT campana_id, tipo, guion, respuesta, respuesta_guion FROM blaster WHERE id = ?', [id]);
+      if (!b) return res.status(404).json({ error: 'El blaster no existe' });
+
+      const no = await puedeCon(req.usuario, b.campana_id);
+      if (no) return res.status(403).json({ error: no });
+
+      const filas = await bd.consultar(
+        `SELECT id, numero, nombre, estado, intentos, ultimo_intento, proximo_intento,
+                ultimo_motivo, segundos_escuchados, datos, audio_archivo
+           FROM blaster_destinatario WHERE blaster_id = ? ORDER BY id LIMIT 2000`, [id]);
+
+      /* Con variables, cada persona escucha un mensaje distinto. Se manda
+         ya armado con sus datos: leyéndolo se detecta un nombre mal
+         escrito en el Excel sin tener que escuchar los audios uno a uno.
+
+         El audio en sí NO va aquí: se pide aparte, solo al pulsar
+         Escuchar. Con una lista de cientos, mandarlos todos haría la
+         pantalla lentísima. */
+      res.json(filas.map((f) => {
+        let mensaje = null;
+        if (b.tipo === 'variables') {
+          let datos = {};
+          try { datos = typeof f.datos === 'string' ? JSON.parse(f.datos || '{}') : (f.datos || {}); }
+          catch { datos = {}; }
+          if (f.nombre && !datos.nombre) datos.nombre = f.nombre;
+          mensaje = conPregunta(b, armarTexto(b.guion, datos).texto);
+        }
+        const { datos, audio_archivo, ...resto } = f;
+        return { ...resto, mensaje, tieneAudio: !!audio_archivo };
+      }));
+    } catch (e) { next(e); }
+  });
+
+/** El audio de una persona, para escucharlo en la pantalla.
+
+    No gasta créditos: usa el audio ya generado y guardado. Solo se
+    convierte a un formato que el navegador sepa reproducir. */
+router.get('/blasters/:id/destinos/:did/audio', auth.exigirSesion, auth.exigir('blaster'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const did = Number(req.params.did);
+
       const b = await bd.una('SELECT campana_id FROM blaster WHERE id = ?', [id]);
       if (!b) return res.status(404).json({ error: 'El blaster no existe' });
 
       const no = await puedeCon(req.usuario, b.campana_id);
       if (no) return res.status(403).json({ error: no });
 
-      res.json(await bd.consultar(
-        `SELECT id, numero, nombre, estado, intentos, ultimo_intento, proximo_intento,
-                ultimo_motivo, segundos_escuchados
-           FROM blaster_destinatario WHERE blaster_id = ? ORDER BY id LIMIT 2000`, [id]));
+      /* El destinatario tiene que ser de ESTE blaster: así nadie pide el
+         audio de otra persona cambiando el número en la dirección. */
+      const d = await bd.una(
+        'SELECT audio_archivo FROM blaster_destinatario WHERE id = ? AND blaster_id = ?', [did, id]);
+      if (!d) return res.status(404).json({ error: 'Esa persona no está en este blaster' });
+      if (!d.audio_archivo) return res.status(404).json({ error: 'Todavía no tiene audio generado' });
+
+      const escuchar = await voz.paraEscuchar(d.audio_archivo);
+      if (!escuchar) return res.status(500).json({ error: 'No se pudo preparar el audio para escucharlo' });
+
+      res.json({ escuchar });
     } catch (e) { next(e); }
   });
 
