@@ -339,8 +339,21 @@ router.put('/troncales/propias/:id', auth.exigirSesion, auth.exigir('usuarios'),
 
 /** Recarga la configuración de la central. */
 async function recargarPjsip() {
-  const r = await preguntarAsterisk('pjsip reload');
-  return r.ok;
+  /* La recarga general no basta: los registros contra el operador y el
+     reconocimiento por dirección tienen sus propios módulos, y si no se
+     recargan, Asterisk no ve la troncal nueva —ni deja de ver la que se
+     desactivó— hasta el siguiente reinicio. Se comprobó en la central. */
+  const ordenes = [
+    'pjsip reload',
+    'module reload res_pjsip_outbound_registration.so',
+    'module reload res_pjsip_endpoint_identifier_ip.so',
+  ];
+  let todo = true;
+  for (const o of ordenes) {
+    const r = await preguntarAsterisk(o);
+    if (!r.ok) todo = false;
+  }
+  return todo;
 }
 
 router.put('/troncales/propias/:id/estado', auth.exigirSesion, auth.exigir('usuarios'),
@@ -386,17 +399,28 @@ router.put('/troncales/propias/:id/estado', auth.exigirSesion, auth.exigir('usua
             [n + '_aor', `sip:${t.servidor}:${t.puerto}`]);
 
           /* La troncal en sí */
+          /* WebRTC y todo lo que arrastra —cifrado, ICE, AVPF— se apagan
+             de forma explícita. La tabla de extensiones trae webrtc=yes
+             POR DEFECTO, porque está pensada para los agentes que llaman
+             desde el navegador. Una troncal que lo heredara le exigiría al
+             operador un cifrado que los operadores telefónicos no usan, y
+             las llamadas no se conectarían. */
           await cx.execute(
             `INSERT INTO ps_endpoints
                (id, transport, context, disallow, allow, aors, outbound_auth,
                 from_user, from_domain, direct_media, rtp_symmetric, force_rport,
-                rewrite_contact, callerid)
-             VALUES (?, 'transport-udp', ?, 'all', ?, ?, ?, ?, ?, 'no', 'yes', 'yes', 'yes', ?)
+                rewrite_contact, callerid,
+                webrtc, ice_support, use_avpf, media_encryption, rtcp_mux,
+                dtls_auto_generate_cert)
+             VALUES (?, 'transport-udp', ?, 'all', ?, ?, ?, ?, ?, 'no', 'yes', 'yes', 'yes', ?,
+                     'no', 'no', 'no', 'no', 'no', 'no')
              ON DUPLICATE KEY UPDATE
                context = VALUES(context), allow = VALUES(allow),
                aors = VALUES(aors), outbound_auth = VALUES(outbound_auth),
                from_user = VALUES(from_user), from_domain = VALUES(from_domain),
-               callerid = VALUES(callerid)`,
+               callerid = VALUES(callerid),
+               webrtc = 'no', ice_support = 'no', use_avpf = 'no',
+               media_encryption = 'no', rtcp_mux = 'no', dtls_auto_generate_cert = 'no'`,
             [n, t.contexto, t.codecs, n + '_aor',
              t.usuario ? n + '_auth' : null,
              t.usuario || null, t.servidor,
@@ -453,7 +477,7 @@ router.put('/troncales/propias/:id/estado', auth.exigirSesion, auth.exigir('usua
         recargada,
         aviso: recargada ? null
           : 'La configuración se guardó, pero no se pudo recargar la central. ' +
-            'Ejecuta "asterisk -rx \'pjsip reload\'" en el servidor.',
+            'Ejecuta en el servidor: asterisk -rx "module reload res_pjsip_outbound_registration.so"',
       });
     } catch (e) { next(e); }
   });
