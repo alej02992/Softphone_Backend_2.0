@@ -282,11 +282,16 @@ class Ami extends EventEmitter {
    * suya, que ya está probada.
    */
   originarBlaster({ numero, audio, digitos = 0, identificador, espera = 40,
-                    contextoSalida = 'from-internal', identificadorLlamada }) {
+                    contextoSalida = 'from-internal', identificadorLlamada, ruta }) {
+    /* RUTA dice por qué troncal sale y con qué prefijo: "troncal/prefijo".
+       Lleva dos guiones bajos delante para que pase al otro lado del
+       canal Local, que es el que marca: sin ellos, el plan de marcación
+       no la vería. */
     const variables = Object.entries({
       BPM_AUDIO: audio,
       BPM_DIGITOS: digitos,
       BPM_ID: identificador || '',
+      __RUTA: ruta || '',
     })
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
       .map(([k, v]) => `${k}=${String(v).replace(/[\r\n,]/g, ' ')}`)

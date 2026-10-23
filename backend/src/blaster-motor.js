@@ -65,7 +65,7 @@ async function blastersActivos() {
   const hoy = DIAS[new Date().getDay()];
 
   return bd.consultar(
-    `SELECT id, nombre, tipo, guion, audio_archivo, voz_id,
+    `SELECT id, nombre, campana_id, tipo, guion, audio_archivo, voz_id,
             respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
             respuesta_digitos, reintentos, intervalo_min
        FROM blaster
@@ -132,6 +132,27 @@ async function audioPara(b, d) {
   return ruta.replace(/\.(wav|ulaw|alaw|gsm|sln|mp3)$/i, '');
 }
 
+/* ═══════════ POR QUÉ TRONCAL SALE ═══════════
+
+   Cada blaster sale por la troncal de su campaña, igual que las llamadas
+   de los agentes. Sin troncal asignada, servcom: así funcionaba antes.
+   Se arma "troncal/prefijo", que es lo que espera el plan de marcación.
+   Se consulta en dos pasos y se cruza en memoria: las tablas no tienen
+   el mismo cotejamiento y unirlas en la consulta falla.                */
+async function rutaDe(campanaId) {
+  try {
+    const c = await bd.una('SELECT troncal_salida FROM campana WHERE id = ?', [campanaId]);
+    const troncal = c && c.troncal_salida ? String(c.troncal_salida) : 'servcom';
+    if (troncal === 'servcom') return 'servcom/';
+    const activas = await bd.consultar("SELECT nombre, prefijo FROM troncal WHERE estado = 'activa'");
+    const t = activas.find((x) => String(x.nombre) === troncal);
+    return t ? `${troncal}/${t.prefijo || ''}` : 'servcom/';
+  } catch {
+    /* Si algo falla —por ejemplo, la columna aún no existe—, servcom */
+    return 'servcom/';
+  }
+}
+
 /* ═══════════ LLAMAR ═══════════ */
 
 async function llamar(b, d) {
@@ -167,6 +188,7 @@ async function llamar(b, d) {
         : b.respuesta_tipo === 'numero' ? (b.respuesta_digitos || 10) : 1,
       identificador: `blaster-${d.id}`,
       contextoSalida: CONFIG.blaster?.contextoSalida || 'from-internal',
+      ruta: await rutaDe(b.campana_id),
     });
 
     if (resp?.ActionID) enVuelo.set(resp.ActionID, d.id);

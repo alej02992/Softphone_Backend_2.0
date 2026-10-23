@@ -196,6 +196,7 @@ const sinClave = (t) => ({
   contexto: t.contexto,
   codecs: t.codecs,
   identificador: t.identificador,
+  prefijo: t.prefijo || '',
   estado: t.estado,
   activada: t.activada,
 });
@@ -237,6 +238,11 @@ function revisar(b, esNueva) {
     return 'Para registrarse hace falta la contraseña del operador';
   }
 
+  /* El prefijo que pide el operador antes del número: solo dígitos */
+  if (b.prefijo && !/^\d{1,20}$/.test(String(b.prefijo).trim())) {
+    return 'El prefijo solo puede tener dígitos';
+  }
+
   const contexto = String(b.contexto || 'from-pstn').trim();
   if (!/^[a-zA-Z0-9_-]{2,40}$/.test(contexto)) return 'El contexto no es válido';
 
@@ -261,11 +267,12 @@ router.post('/troncales/propias', auth.exigirSesion, auth.exigir('usuarios'),
 
       const [r] = await bd.pool.execute(
         `INSERT INTO troncal
-           (nombre, descripcion, servidor, puerto, usuario, clave, registra,
+           (nombre, descripcion, servidor, puerto, prefijo, usuario, clave, registra,
             contexto, codecs, identificador, estado, creada_por)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'borrador', ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'borrador', ?)`,
         [nombre, (b.descripcion || '').slice(0, 160) || null,
          String(b.servidor).trim(), Number(b.puerto) || 5060,
+         String(b.prefijo || '').trim() || null,
          String(b.usuario || '').trim() || null,
          String(b.clave || '').trim() || null,
          b.registra ? 1 : 0,
@@ -304,12 +311,13 @@ router.put('/troncales/propias/:id', auth.exigirSesion, auth.exigir('usuarios'),
 
       await bd.consultar(
         `UPDATE troncal
-            SET descripcion = ?, servidor = ?, puerto = ?, usuario = ?,
+            SET descripcion = ?, servidor = ?, puerto = ?, prefijo = ?, usuario = ?,
                 clave = COALESCE(?, clave), registra = ?, contexto = ?,
                 codecs = ?, identificador = ?
           WHERE id = ?`,
         [(b.descripcion || '').slice(0, 160) || null,
          String(b.servidor).trim(), Number(b.puerto) || 5060,
+         String(b.prefijo || '').trim() || null,
          String(b.usuario || '').trim() || null,
          String(b.clave || '').trim() || null,
          b.registra ? 1 : 0,
@@ -451,6 +459,21 @@ router.put('/troncales/propias/:id/estado', auth.exigirSesion, auth.exigir('usua
         });
 
       } else {
+        /* Si alguna campaña sale por esta troncal, no se desactiva: sus
+           llamadas se quedarían sin salida. Primero hay que pasarlas a
+           otra en Rutas de salida. Se compara en memoria por la misma
+           razón de cotejamiento que en la activación. */
+        const usan = (await bd.consultar(
+          'SELECT nombre, troncal_salida FROM campana WHERE troncal_salida IS NOT NULL'))
+          .filter((c) => String(c.troncal_salida) === n)
+          .map((c) => c.nombre);
+        if (usan.length) {
+          return res.status(409).json({
+            error: `No se puede desactivar: la usan ${usan.length === 1 ? 'la campaña' : 'las campañas'} ` +
+                   `${usan.join(', ')}. Cámbialas de troncal en Rutas de salida.`,
+          });
+        }
+
         /* Desactivar: se quita de la central, pero la configuración se
            conserva en nuestra tabla para poder volver a activarla. */
         await bd.transaccion(async (cx) => {
@@ -498,6 +521,79 @@ router.delete('/troncales/propias/:id', auth.exigirSesion, auth.exigir('usuarios
         `Eliminó la troncal ${t.nombre}`, req.ip);
 
       res.json({ ok: true });
+    } catch (e) { next(e); }
+  });
+
+/* ═══════════ RUTAS DE SALIDA ═══════════
+
+   Por qué troncal sale cada campaña. Sin troncal asignada, la campaña
+   sale por servcom con su prefijo de siempre: así funcionaba todo antes
+   de este módulo, y así sigue mientras nadie asigne otra.
+
+   La central no lee esta tabla directamente: consulta la vista
+   v_ruta_salida, que solo dice qué troncal y qué prefijo le tocan a cada
+   extensión. El cambio vale desde la llamada siguiente, sin recargar
+   nada.                                                               */
+
+const PRINCIPAL = 'servcom';
+
+router.get('/troncales/rutas', auth.exigirSesion, auth.exigir('usuarios'),
+  async (req, res, next) => {
+    try {
+      const campanas = await bd.consultar(
+        'SELECT id, nombre, troncal_salida FROM campana ORDER BY nombre');
+      const propias = await bd.consultar(
+        "SELECT nombre, prefijo FROM troncal WHERE estado = 'activa' ORDER BY nombre");
+
+      /* Cuántos agentes con extensión tiene cada campaña: es lo que se ve
+         afectado al cambiarle la troncal. */
+      const agentes = await bd.consultar(
+        `SELECT campana_id, COUNT(*) AS n FROM usuario
+          WHERE extension IS NOT NULL AND extension <> '' GROUP BY campana_id`);
+
+      res.json({
+        troncales: [
+          { nombre: PRINCIPAL, etiqueta: `${PRINCIPAL} (principal)`, principal: true },
+          ...propias.map((t) => ({
+            nombre: t.nombre,
+            etiqueta: t.prefijo ? `${t.nombre} · prefijo ${t.prefijo}` : t.nombre,
+          })),
+        ],
+        campanas: campanas.map((c) => ({
+          id: c.id,
+          nombre: c.nombre,
+          troncal: c.troncal_salida || PRINCIPAL,
+          agentes: Number((agentes.find((a) => a.campana_id === c.id) || {}).n) || 0,
+        })),
+      });
+    } catch (e) { next(e); }
+  });
+
+router.put('/troncales/rutas/:id', auth.exigirSesion, auth.exigir('usuarios'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const elegida = String(req.body?.troncal || PRINCIPAL).trim();
+
+      const c = await bd.una('SELECT id, nombre FROM campana WHERE id = ?', [id]);
+      if (!c) return res.status(404).json({ error: 'Esa campaña no existe' });
+
+      /* Solo se puede asignar la principal o una troncal propia activa:
+         una inactiva no está en la central y las llamadas no saldrían. */
+      if (elegida !== PRINCIPAL) {
+        const activas = await bd.consultar("SELECT nombre FROM troncal WHERE estado = 'activa'");
+        if (!activas.some((t) => String(t.nombre) === elegida)) {
+          return res.status(400).json({ error: 'Esa troncal no existe o no está activa' });
+        }
+      }
+
+      await bd.consultar('UPDATE campana SET troncal_salida = ? WHERE id = ?',
+        [elegida === PRINCIPAL ? null : elegida, id]);
+
+      await auth.auditar(req.usuario.id, 'modificar', 'campana', id,
+        `La campaña ${c.nombre} ahora sale por ${elegida}`, req.ip);
+
+      res.json({ ok: true, troncal: elegida });
     } catch (e) { next(e); }
   });
 
