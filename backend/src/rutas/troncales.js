@@ -464,7 +464,7 @@ router.put('/troncales/propias/:id/estado', auth.exigirSesion, auth.exigir('usua
            otra en Rutas de salida. Se compara en memoria por la misma
            razón de cotejamiento que en la activación. */
         const usan = (await bd.consultar(
-          'SELECT nombre, troncal_salida FROM campana WHERE troncal_salida IS NOT NULL'))
+          'SELECT nombre, troncal_salida FROM campana WHERE troncal_salida IS NOT NULL AND activa = TRUE'))
           .filter((c) => String(c.troncal_salida) === n)
           .map((c) => c.nombre);
         if (usan.length) {
@@ -540,8 +540,11 @@ const PRINCIPAL = 'servcom';
 router.get('/troncales/rutas', auth.exigirSesion, auth.exigir('usuarios'),
   async (req, res, next) => {
     try {
+      /* Solo las campañas activas, como en el resto de la plataforma.
+         Antes salían también las de las primeras pruebas —Cobranza,
+         Retención, Ventas 2026— que ya no existen para nadie. */
       const campanas = await bd.consultar(
-        'SELECT id, nombre, troncal_salida FROM campana ORDER BY nombre');
+        'SELECT id, nombre, troncal_salida FROM campana WHERE activa = TRUE ORDER BY nombre');
       const propias = await bd.consultar(
         "SELECT nombre, prefijo FROM troncal WHERE estado = 'activa' ORDER BY nombre");
 
@@ -575,8 +578,8 @@ router.put('/troncales/rutas/:id', auth.exigirSesion, auth.exigir('usuarios'),
       const id = Number(req.params.id);
       const elegida = String(req.body?.troncal || PRINCIPAL).trim();
 
-      const c = await bd.una('SELECT id, nombre FROM campana WHERE id = ?', [id]);
-      if (!c) return res.status(404).json({ error: 'Esa campaña no existe' });
+      const c = await bd.una('SELECT id, nombre FROM campana WHERE id = ? AND activa = TRUE', [id]);
+      if (!c) return res.status(404).json({ error: 'Esa campaña no existe o no está activa' });
 
       /* Solo se puede asignar la principal o una troncal propia activa:
          una inactiva no está en la central y las llamadas no saldrían. */
