@@ -224,7 +224,47 @@ router.get('/reportes/sesiones', auth.exigirSesion, auth.exigir('reportes'),
       const totalConectado = sesiones.reduce((s, x) => s + x._conectado, 0);
       const totalPausa = sesiones.reduce((s, x) => s + x._pausa, 0);
 
+      /* El reparto: en qué se fue el tiempo de pausa, y quién pasó más
+         tiempo en pausa. Se mide en tiempo, no en cantidad de pausas:
+         diez pausas de un minuto pesan menos que una de una hora. */
+      const pct = (n, total) => (total ? Math.round((n / total) * 1000) / 10 : 0);
+      const aSeg = (txt) => {
+        const m = String(txt || '').match(/(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?/);
+        return m ? (Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0)) : 0;
+      };
+
+      const porMotivo = new Map();
+      sesiones.forEach((s) => (s.detallePausas || []).forEach((p) => {
+        porMotivo.set(p.motivo, (porMotivo.get(p.motivo) || 0) + aSeg(p.duracion));
+      }));
+      const totalMotivos = [...porMotivo.values()].reduce((a, b) => a + b, 0);
+
+      const porAgente = new Map();
+      sesiones.forEach((s) => {
+        const a = porAgente.get(s.agente) || { conectado: 0, pausa: 0 };
+        a.conectado += s._conectado; a.pausa += s._pausa;
+        porAgente.set(s.agente, a);
+      });
+
+      const reparto = [];
+      if (totalMotivos) {
+        reparto.push({
+          etiqueta: 'Tiempo en pausa por motivo', total: duracion(totalMotivos), unidad: 'en pausa',
+          opciones: [...porMotivo.entries()].sort((a, z) => z[1] - a[1])
+            .map(([motivo, seg]) => ({ valor: motivo, cantidad: duracion(seg), porcentaje: pct(seg, totalMotivos) })),
+        });
+      }
+      if (porAgente.size) {
+        reparto.push({
+          etiqueta: 'Parte del turno en pausa, por agente', total: porAgente.size, unidad: 'agentes',
+          opciones: [...porAgente.entries()]
+            .map(([agente, a]) => ({ valor: agente, cantidad: duracion(a.pausa), porcentaje: pct(a.pausa, a.conectado) }))
+            .sort((a, z) => z.porcentaje - a.porcentaje),
+        });
+      }
+
       res.json({
+        reparto,
         resumen: {
           sesiones: sesiones.length,
           agentes: new Set(sesiones.map((s) => s.usuario)).size,
@@ -705,7 +745,7 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
          reparto. Antes el PDF solo traía la tabla, y quien lo recibía
          tenía que contar a mano lo que la pantalla ya calculaba. */
       const resumen = Array.isArray(req.body.resumen) ? req.body.resumen.slice(0, 6) : [];
-      const reparto = Array.isArray(req.body.reparto) ? req.body.reparto.slice(0, 3) : [];
+      const reparto = Array.isArray(req.body.reparto) ? req.body.reparto.slice(0, 6) : [];
 
       /* El reporte de formularios trae sus propias columnas, porque
          cada formulario tiene las suyas. Los demás las tienen fijas. */
@@ -745,11 +785,47 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
         });
 
         const hoja = XLSX.utils.json_to_sheet(datos);
-        /* Un ancho razonable por columna: sin esto todo sale estrecho */
-        hoja['!cols'] = columnas.map(([clave]) =>
-          ({ wch: clave === 'observaciones' ? 40 : clave === 'agente' ? 22 : 14 }));
+
+        /* Cada columna tan ancha como su contenido más largo, con tope:
+           antes todas medían lo mismo y las preguntas largas de los
+           formularios se cortaban. */
+        hoja['!cols'] = columnas.map(([clave, etiqueta]) => {
+          const largo = Math.max(String(etiqueta).length,
+            ...filas.slice(0, 500).map((f) => String(f[clave] ?? '').length));
+          return { wch: Math.min(50, Math.max(8, largo + 2)) };
+        });
+
+        /* Filtros en los títulos: se puede ordenar y filtrar sin
+           configurar nada. */
+        if (hoja['!ref']) hoja['!autofilter'] = { ref: hoja['!ref'] };
 
         const libro = XLSX.utils.book_new();
+
+        /* Una hoja de RESUMEN primero, con lo mismo que se ve arriba en
+           la pantalla: los indicadores y cada reparto con su porcentaje.
+           Quien abre el Excel ve primero las conclusiones y después los
+           datos. */
+        if (resumen.length || reparto.length) {
+          const filasRes = [[titulo], [`BPM Consulting · ${subtitulo}`], []];
+          if (resumen.length) {
+            filasRes.push(['Indicador', 'Valor', 'Detalle']);
+            resumen.forEach((t) => {
+              const [etq, valor, sub] = Array.isArray(t) ? t : [t.etiqueta, t.valor, t.sub];
+              filasRes.push([etq, valor, sub || '']);
+            });
+            filasRes.push([]);
+          }
+          reparto.forEach((g) => {
+            filasRes.push([g.etiqueta || 'Resultados', 'Cantidad', 'Porcentaje']);
+            (g.opciones || []).forEach((o) =>
+              filasRes.push([o.valor ?? o.resultado ?? '', o.cantidad ?? '', `${o.porcentaje ?? 0}%`]));
+            filasRes.push([]);
+          });
+          const hojaRes = XLSX.utils.aoa_to_sheet(filasRes);
+          hojaRes['!cols'] = [{ wch: 42 }, { wch: 16 }, { wch: 30 }];
+          XLSX.utils.book_append_sheet(libro, hojaRes, 'Resumen');
+        }
+
         XLSX.utils.book_append_sheet(libro, hoja, titulo.slice(0, 30));
 
         return res.json({
@@ -840,35 +916,69 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
             y += 48;
           }
 
-          reparto.forEach((grupo) => {
-            const opciones = (grupo.opciones || []).slice(0, 8);
-            if (!opciones.length) return;
+          /* Los grupos de barras van de dos en dos, lado a lado: con
+             tres o cuatro grupos uno debajo de otro, el resumen se comía
+             la primera página entera. Si hay un solo grupo, usa todo el
+             ancho. */
+          const grupos = reparto.filter((g) => (g.opciones || []).length);
+          const columnasRep = grupos.length > 1 ? 2 : 1;
+          const sepRep = 24;
+          const anchoGrupo = (ancho - sepRep * (columnasRep - 1)) / columnasRep;
 
-            doc.fontSize(8).fillColor('#002E44')
-               .text(`${grupo.etiqueta || 'Resultados'} · ${grupo.total ?? ''} ${
-                 /lista/i.test(grupo.etiqueta || '') ? 'personas' : 'respuestas'}`, 30, y);
-            y += 13;
+          for (let i = 0; i < grupos.length; i += columnasRep) {
+            let yFila = y;
+            grupos.slice(i, i + columnasRep).forEach((grupo, j) => {
+              const x0 = 30 + j * (anchoGrupo + sepRep);
+              let yy = y;
+              const opciones = grupo.opciones.slice(0, 8);
+              const unidad = grupo.unidad ||
+                (/lista/i.test(grupo.etiqueta || '') ? 'personas' : 'registros');
 
-            const anchoNombre = 170, anchoBarra = ancho - anchoNombre - 90;
-            opciones.forEach((o) => {
-              const pct = Math.max(0, Math.min(100, Number(o.porcentaje) || 0));
-              doc.fontSize(7.5).fillColor('#1b1f24')
-                 .text(String(o.valor ?? o.resultado ?? ''), 30, y + 1, { width: anchoNombre - 8, ellipsis: true });
-              doc.roundedRect(30 + anchoNombre, y + 2, anchoBarra, 7, 3).fillColor('#E8EDF0').fill();
-              if (pct > 0) {
-                doc.roundedRect(30 + anchoNombre, y + 2, Math.max(4, anchoBarra * pct / 100), 7, 3)
-                   .fillColor(o.sinRespuesta ? '#A9B4BC' : '#00A0D6').fill();
+              doc.fontSize(8).fillColor('#002E44')
+                 .text(`${grupo.etiqueta || 'Resultados'} · ${grupo.total ?? ''} ${unidad}`, x0, yy,
+                   { width: anchoGrupo, ellipsis: true });
+              yy += 13;
+
+              const anchoNombre = Math.min(150, anchoGrupo * 0.34);
+              const anchoNum = 78;
+              const anchoBarra = anchoGrupo - anchoNombre - anchoNum - 6;
+              opciones.forEach((o) => {
+                const pct = Math.max(0, Math.min(100, Number(o.porcentaje) || 0));
+                doc.fontSize(7.5).fillColor(o.sinRespuesta ? '#8B979F' : '#1b1f24')
+                   .text(String(o.valor ?? o.resultado ?? ''), x0, yy + 1,
+                     { width: anchoNombre - 6, ellipsis: true, lineBreak: false });
+                doc.roundedRect(x0 + anchoNombre, yy + 2, anchoBarra, 7, 3).fillColor('#E8EDF0').fill();
+                if (pct > 0) {
+                  doc.roundedRect(x0 + anchoNombre, yy + 2, Math.max(4, anchoBarra * pct / 100), 7, 3)
+                     .fillColor(o.sinRespuesta ? '#A9B4BC' : '#00A0D6').fill();
+                }
+                doc.fontSize(7.5).fillColor('#5A6670')
+                   .text(`${o.cantidad ?? ''}  ·  ${pct}%`, x0 + anchoNombre + anchoBarra + 6, yy + 1,
+                     { width: anchoNum, align: 'right', lineBreak: false });
+                yy += 12;
+              });
+              if ((grupo.opciones || []).length > 8) {
+                doc.fontSize(6.5).fillColor('#8B979F')
+                   .text(`y ${grupo.opciones.length - 8} más`, x0, yy, { width: anchoGrupo });
+                yy += 10;
               }
-              doc.fontSize(7.5).fillColor('#5A6670')
-                 .text(`${o.cantidad ?? ''}  ·  ${pct}%`, 30 + anchoNombre + anchoBarra + 8, y + 1,
-                   { width: 80, align: 'right' });
-              y += 12;
+              yFila = Math.max(yFila, yy);
             });
-            y += 6;
-          });
+            y = yFila + 8;
+          }
 
           return y;
         };
+
+        /* Formularios con muchas preguntas no caben en una tabla: con
+           veinte columnas, cada una queda de dos centímetros y el texto
+           se monta. Se imprimen en FICHAS: una por respuesta, con sus
+           preguntas en bloques ordenados. Los demás reportes siguen en
+           tabla, que es como mejor se leen. */
+        const enFichas = reporte === 'formularios' && columnas.length > 8;
+        const META = ['fecha', 'hora', 'agente', 'numero', 'campana', 'contacto'];
+        const metaCols = enFichas ? columnas.filter(([c]) => META.includes(c)) : [];
+        const preguntas = enFichas ? columnas.filter(([c]) => !META.includes(c)) : [];
 
         /* El resumen va solo en la primera página */
         let primeraPagina = true;
@@ -911,6 +1021,9 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
           }
           primeraPagina = false;
 
+          /* En fichas no hay fila de títulos: cada ficha lleva los suyos */
+          if (enFichas) return yCols + 2;
+
           let cx = 30;
           doc.fontSize(tituloPt).fillColor('#002E44');
 
@@ -937,7 +1050,60 @@ router.post('/reportes/exportar', auth.exigirSesion, auth.exigir('reportes'),
 
         doc.fontSize(cuerpoPt);
 
-        filas.forEach((f, n) => {
+        if (enFichas) {
+          /* Cuatro bloques por fila de la ficha. Cada bloque: la pregunta
+             en gris, pequeña, y la respuesta debajo. La altura de cada fila
+             de bloques es la de su respuesta más larga. */
+          const porFila = 4, sepB = 10;
+          const anchoB = (ancho - 20 - sepB * (porFila - 1)) / porFila;
+
+          filas.forEach((f, n) => {
+            /* Se mide la ficha completa antes de dibujarla, para no
+               partirla entre dos páginas. */
+            const bloques = [];
+            for (let i = 0; i < preguntas.length; i += porFila) {
+              const trozo = preguntas.slice(i, i + porFila);
+              const alto = Math.max(...trozo.map(([clave, etiqueta]) => {
+                doc.fontSize(6.3);
+                const hP = Math.min(doc.heightOfString(String(etiqueta), { width: anchoB }), 16);
+                doc.fontSize(7.8);
+                const hR = Math.min(doc.heightOfString(String(f[clave] ?? '—') || '—', { width: anchoB }), 40);
+                return hP + hR + 4;
+              }));
+              bloques.push({ trozo, alto });
+            }
+            const altoFicha = 22 + bloques.reduce((s, x) => s + x.alto + 4, 0) + 8;
+
+            if (y + altoFicha > doc.page.height - 42) { doc.addPage(); y = cabecera(); }
+
+            doc.roundedRect(30, y, ancho, altoFicha - 6, 6).fillColor(n % 2 ? '#F7F9FB' : '#FFFFFF').fill();
+            doc.roundedRect(30, y, ancho, altoFicha - 6, 6).strokeColor('#DDE3E8').lineWidth(0.6).stroke();
+
+            /* La cabecera de la ficha: número, fecha, agente, cliente */
+            const meta = metaCols.map(([clave]) => f[clave]).filter((v) => v !== undefined && v !== '');
+            doc.fontSize(8).fillColor('#002E44')
+               .text(`#${n + 1}`, 40, y + 7, { continued: true })
+               .fillColor('#5A6670').text(meta.length ? `   ${meta.join('  ·  ')}` : '', { lineBreak: false });
+
+            let yy = y + 22;
+            bloques.forEach(({ trozo, alto }) => {
+              trozo.forEach(([clave, etiqueta], k) => {
+                const x = 40 + k * (anchoB + sepB);
+                doc.fontSize(6.3).fillColor('#8B979F')
+                   .text(String(etiqueta).toUpperCase(), x, yy, { width: anchoB, height: 16, ellipsis: true });
+                const hP = Math.min(doc.heightOfString(String(etiqueta).toUpperCase(), { width: anchoB }), 16);
+                const valor = String(f[clave] ?? '').trim() || '—';
+                doc.fontSize(7.8).fillColor(valor === '—' ? '#A9B4BC' : '#1b1f24')
+                   .text(valor, x, yy + hP + 2, { width: anchoB, height: 40, ellipsis: true });
+              });
+              yy += alto + 4;
+            });
+
+            y += altoFicha;
+          });
+        }
+
+        if (!enFichas) filas.forEach((f, n) => {
           /* Cuánto mide la fila más alta de esta línea. Antes la altura
              era fija: si un texto ocupaba dos líneas, se salía por
              debajo y se montaba sobre la fila siguiente. */
