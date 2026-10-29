@@ -170,8 +170,13 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
                  JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
                 WHERE p.usuario_id = u.id AND p.fin IS NULL
                 ORDER BY p.inicio DESC LIMIT 1) AS pausa_motivo,
-              (SELECT pt.limite_minutos FROM pausa p
+              /* La duración de esa pausa en la campaña del agente: la
+                 propia de la campaña si la tiene, si no la general. */
+              (SELECT IF(plc.pausa_tipo_id IS NULL, pt.limite_minutos, plc.limite_minutos)
+                 FROM pausa p
                  JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
+                 LEFT JOIN pausa_limite_campana plc
+                        ON plc.pausa_tipo_id = pt.id AND plc.campana_id = u.campana_id
                 WHERE p.usuario_id = u.id AND p.fin IS NULL
                 ORDER BY p.inicio DESC LIMIT 1) AS pausa_limite,
               (SELECT p.inicio FROM pausa p

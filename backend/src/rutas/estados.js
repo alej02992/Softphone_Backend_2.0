@@ -8,6 +8,16 @@
 
    El agente solo puede usar estados activos: ya no escribe los suyos.
 
+   Hay dos clases de estados:
+
+     Básicos     los generales (break, almuerzo, baño, reunión…). Los ven
+                 todas las campañas y NO se pueden borrar ni desactivar.
+                 Lo único que cambia es su duración, y cada campaña puede
+                 tener la suya (tabla pausa_limite_campana). Si no tiene,
+                 usa la duración general.
+     Propios     los que crea un supervisor para una campaña. Se crean,
+                 cambian y borran libremente.
+
    Este archivo se monta ANTES que operacion.js, así que su ruta
    POST /pausas es la que atiende las peticiones y reemplaza a la
    anterior, que creaba estados nuevos con cualquier texto.
@@ -40,6 +50,17 @@ async function campanasDe(usuario) {
   }
   return ids;
 }
+
+/* ═══════════ LA DURACIÓN QUE APLICA ═══════════
+   La de la campaña si la tiene, si no la general. Ojo: una fila con
+   limite_minutos vacío quiere decir "sin límite en esta campaña", que no
+   es lo mismo que no tener fila. Por eso se mira si existe la fila, no
+   si el valor está vacío.
+
+   Uso: unir pausa_limite_campana como `plc` y poner LIMITE_EFECTIVO
+   donde antes iba t.limite_minutos.                                     */
+const LIMITE_EFECTIVO = (t = 't') =>
+  `IF(plc.pausa_tipo_id IS NULL, ${t}.limite_minutos, plc.limite_minutos)`;
 
 /* Las campañas sobre las que puede crear estados. El desplegable de la
    plataforma se llena con esto. */
@@ -97,16 +118,25 @@ router.get('/pausas/tipos', auth.exigirSesion, async (req, res, next) => {
     const todos = req.query.todos === '1' &&
       (req.usuario.permisos || []).includes('supervision');
 
-    let sql = `SELECT t.id, t.nombre, t.productiva, t.limite_minutos, t.activo,
-                      t.campana_id, c.nombre AS campana
-                 FROM pausa_tipo t
-                 LEFT JOIN campana c ON c.id = t.campana_id`;
-    const val = [];
+    let sql, val;
 
     if (!todos) {
+      /* El agente: cada estado con la duración de SU campaña */
       const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
-      sql += ' WHERE t.activo = TRUE AND (t.campana_id IS NULL OR t.campana_id = ?)';
-      val.push(yo?.campana_id || 0);
+      const mia = yo?.campana_id || 0;
+      sql = `SELECT t.id, t.nombre, t.productiva, ${LIMITE_EFECTIVO()} AS limite_minutos, t.activo,
+                    t.campana_id, c.nombre AS campana
+               FROM pausa_tipo t
+               LEFT JOIN campana c ON c.id = t.campana_id
+               LEFT JOIN pausa_limite_campana plc ON plc.pausa_tipo_id = t.id AND plc.campana_id = ?
+              WHERE t.activo = TRUE AND (t.campana_id IS NULL OR t.campana_id = ?)`;
+      val = [mia, mia];
+    } else {
+      sql = `SELECT t.id, t.nombre, t.productiva, t.limite_minutos, t.activo,
+                    t.campana_id, c.nombre AS campana
+               FROM pausa_tipo t
+               LEFT JOIN campana c ON c.id = t.campana_id`;
+      val = [];
     }
 
     sql += ' ORDER BY t.campana_id IS NULL DESC, t.id';
@@ -114,10 +144,24 @@ router.get('/pausas/tipos', auth.exigirSesion, async (req, res, next) => {
     const filas = await bd.consultar(sql, val);
     const mias = todos ? await campanasDe(req.usuario) : null;
 
+    /* Para administrar: la duración de cada básico en cada campaña que
+       ve quien pregunta. */
+    const porCampana = new Map();
+    if (todos) {
+      const cond = mias === null ? '' : mias.length ? ` WHERE campana_id IN (${mias.map(() => '?').join(',')})` : ' WHERE 1 = 0';
+      (await bd.consultar(`SELECT pausa_tipo_id, campana_id, limite_minutos FROM pausa_limite_campana${cond}`,
+        mias === null ? [] : mias)).forEach((x) => {
+        if (!porCampana.has(x.pausa_tipo_id)) porCampana.set(x.pausa_tipo_id, {});
+        porCampana.get(x.pausa_tipo_id)[x.campana_id] = x.limite_minutos;
+      });
+    }
+
     res.json(filas.map((f) => ({
       ...f,
       activo: !!f.activo,
       productiva: !!f.productiva,
+      basico: !f.campana_id,
+      ...(todos && !f.campana_id ? { porCampana: porCampana.get(f.id) || {} } : {}),
       /* El supervisor ve los estados generales para entender por qué
          sus agentes tienen esos botones, pero no puede modificarlos:
          afectarían a campañas que no son suyas. */
@@ -222,6 +266,12 @@ router.put('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'), a
     if (puede) return res.status(403).json({ error: puede });
 
     const activo = req.body.activo === undefined ? undefined : !!req.body.activo;
+
+    /* Un básico no se desactiva ni se pasa a una campaña: es de todas */
+    if (!t.campana_id && (activo === false || req.body.campana_id)) {
+      return res.status(409).json({
+        error: `"${t.nombre}" es un estado básico: no se puede desactivar. Puedes cambiar su duración.` });
+    }
     const campana_id = req.body.campana_id === undefined
       ? undefined : (Number(req.body.campana_id) || null);
 
@@ -244,6 +294,58 @@ router.put('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision'), a
   } catch (e) { next(e); }
 });
 
+/* ═══════════ DURACIÓN DE UN BÁSICO EN UNA CAMPAÑA ═══════════
+   { limite_minutos: 10 }      → 10 minutos en esta campaña
+   { limite_minutos: null }    → sin límite en esta campaña
+   { usarGeneral: true }       → vuelve a la duración general
+
+   El supervisor solo en sus campañas; el administrador, en todas.   */
+router.put('/pausas/tipos/:id/campanas/:campanaId', auth.exigirSesion, auth.exigir('supervision'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const campanaId = Number(req.params.campanaId);
+
+      const t = await bd.una('SELECT nombre, campana_id, limite_minutos FROM pausa_tipo WHERE id = ?', [id]);
+      if (!t) return res.status(404).json({ error: 'El estado no existe' });
+      if (t.campana_id) {
+        return res.status(400).json({ error: 'Ese estado es propio de una campaña: cambia su duración directamente.' });
+      }
+
+      const c = await bd.una('SELECT nombre FROM campana WHERE id = ? AND activa = TRUE', [campanaId]);
+      if (!c) return res.status(404).json({ error: 'Esa campaña no existe o no está activa' });
+
+      const mias = await campanasDe(req.usuario);
+      if (mias !== null && !mias.includes(campanaId)) {
+        return res.status(403).json({ error: 'Esa campaña no está a tu cargo.' });
+      }
+
+      if (req.body?.usarGeneral) {
+        await bd.consultar('DELETE FROM pausa_limite_campana WHERE pausa_tipo_id = ? AND campana_id = ?', [id, campanaId]);
+        await auth.auditar(req.usuario.id, 'modificar', 'pausa_tipo', id,
+          `"${t.nombre}" en ${c.nombre} vuelve a la duración general`, req.ip);
+        return res.json({ ok: true, general: true, limite_minutos: t.limite_minutos });
+      }
+
+      let lim = req.body?.limite_minutos;
+      lim = lim === null || lim === '' || lim === undefined ? null : Number(lim);
+      if (lim !== null && (!Number.isInteger(lim) || lim < 1 || lim > 480)) {
+        return res.status(400).json({ error: 'La duración va de 1 a 480 minutos, o sin límite' });
+      }
+
+      await bd.consultar(
+        `INSERT INTO pausa_limite_campana (pausa_tipo_id, campana_id, limite_minutos, modificado_por)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE limite_minutos = VALUES(limite_minutos), modificado_por = VALUES(modificado_por)`,
+        [id, campanaId, lim, req.usuario.id]);
+
+      await auth.auditar(req.usuario.id, 'modificar', 'pausa_tipo', id,
+        `"${t.nombre}" en ${c.nombre}: ${lim === null ? 'sin límite' : lim + ' minutos'}`, req.ip);
+
+      res.json({ ok: true, limite_minutos: lim });
+    } catch (e) { next(e); }
+  });
+
 /* ═══════════ ELIMINAR ═══════════
    Solo si nunca se usó. Si ya tiene pausas registradas, borrarlo se
    llevaría esas filas y los reportes de productividad quedarían
@@ -255,6 +357,11 @@ router.delete('/pausas/tipos/:id', auth.exigirSesion, auth.exigir('supervision')
       const id = Number(req.params.id);
       const t = await bd.una('SELECT nombre, campana_id FROM pausa_tipo WHERE id = ?', [id]);
       if (!t) return res.status(404).json({ error: 'El estado no existe' });
+
+      if (!t.campana_id) {
+        return res.status(409).json({
+          error: `"${t.nombre}" es un estado básico: no se puede eliminar. Puedes cambiar su duración.` });
+      }
 
       const puede = await puedeTocar(req.usuario, t);
       if (puede) return res.status(403).json({ error: puede });
@@ -290,15 +397,17 @@ router.get('/pausas/excedidas', auth.exigirSesion, auth.exigir('supervision'),
 
       let sql = `SELECT u.id, u.nombre, u.extension, u.campana_id,
                         c.nombre AS campana, pt.nombre AS estado,
-                        pt.limite_minutos, p.inicio,
+                        ${LIMITE_EFECTIVO('pt')} AS limite_minutos, p.inicio,
                         TIMESTAMPDIFF(SECOND, p.inicio, NOW()) AS segundos
                    FROM pausa p
                    JOIN usuario u   ON u.id = p.usuario_id
                    JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
                    LEFT JOIN campana c ON c.id = u.campana_id
+                   LEFT JOIN pausa_limite_campana plc
+                          ON plc.pausa_tipo_id = pt.id AND plc.campana_id = u.campana_id
                   WHERE p.fin IS NULL
-                    AND pt.limite_minutos IS NOT NULL
-                    AND TIMESTAMPDIFF(SECOND, p.inicio, NOW()) > pt.limite_minutos * 60
+                    AND ${LIMITE_EFECTIVO('pt')} IS NOT NULL
+                    AND TIMESTAMPDIFF(SECOND, p.inicio, NOW()) > ${LIMITE_EFECTIVO('pt')} * 60
                     /* Solo cuenta si la persona tiene la sesión abierta: una
                        pausa sin sesión es un resto de un turno anterior, no
                        alguien que se pasó del tiempo. */
@@ -341,11 +450,12 @@ router.post('/pausas', auth.exigirSesion, async (req, res, next) => {
        comprueba aquí porque la pantalla se puede saltar. */
     const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
     const t = await bd.una(
-      `SELECT id, limite_minutos FROM pausa_tipo
-        WHERE nombre = ? AND activo = TRUE
-          AND (campana_id IS NULL OR campana_id = ?)
+      `SELECT t.id, ${LIMITE_EFECTIVO()} AS limite_minutos FROM pausa_tipo t
+         LEFT JOIN pausa_limite_campana plc ON plc.pausa_tipo_id = t.id AND plc.campana_id = ?
+        WHERE t.nombre = ? AND t.activo = TRUE
+          AND (t.campana_id IS NULL OR t.campana_id = ?)
         LIMIT 1`,
-      [String(tipo).trim(), yo?.campana_id || 0]);
+      [yo?.campana_id || 0, String(tipo).trim(), yo?.campana_id || 0]);
 
     if (!t) {
       return res.status(400).json({
