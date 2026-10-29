@@ -1,8 +1,8 @@
 /* ═══════════════════════════════════════════════════════════════════
    ESTADO EN VIVO DE LA OPERACIÓN
 
-   Alimenta el panel del supervisor. Responde a una pregunta simple:
-   ¿qué está pasando ahora mismo?
+   Alimenta el panel de seguimiento del supervisor. Responde a una
+   pregunta simple: ¿qué está pasando ahora mismo?
 
    De dónde sale cada dato:
 
@@ -11,16 +11,21 @@
                           ocho horas, deja de aparecer.
 
      Estado y desde cuándo  tabla `pausa`. La última fila sin `fin` es
-                          la pausa en curso; si no hay ninguna, el
-                          agente está disponible.
+                          la pausa en curso, con el tiempo máximo de su
+                          tipo; si no hay ninguna, está disponible.
 
      Llamadas activas     se consulta a Asterisk. Si el backend no
                           puede ejecutar el comando, se informa en la
                           respuesta en lugar de inventar datos.
 
+     Números del día      tabla `interaccion`: cuántas llamadas lleva
+                          cada agente, cuántas contestadas y cuánto ha
+                          hablado.
+
+     Llamadas en cola     se pregunta a la central por AMI, como en el
+                          escritorio del agente.
+
    No usa eventos: el navegador vuelve a preguntar cada pocos segundos.
-   Es menos inmediato que escuchar el AMI, pero funciona sin montar un
-   canal permanente y el supervisor no nota la diferencia.
    ═══════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -28,6 +33,7 @@ const express = require('express');
 const { exec } = require('child_process');
 const bd = require('../bd');
 const auth = require('../auth');
+const ami = require('../ami');
 
 const router = express.Router();
 
@@ -70,6 +76,77 @@ function interpretarCanales(texto) {
   return canales;
 }
 
+/**
+ * Qué campañas puede ver quien pregunta. null = todas (administrador).
+ *
+ * Un supervisor ve las que tiene a cargo; si no tiene ninguna asignada,
+ * la suya propia, para que uno recién creado no vea la pantalla vacía.
+ */
+async function campanasVisibles(usuario) {
+  if (usuario.rol === 'admin') return null;
+  const filas = await bd.consultar(
+    'SELECT campana_id FROM usuario_campana WHERE usuario_id = ?', [usuario.id]);
+  let ids = filas.map((f) => f.campana_id);
+  if (!ids.length) {
+    const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [usuario.id]);
+    if (yo?.campana_id) ids = [yo.campana_id];
+  }
+  return ids;
+}
+
+/** El trozo de consulta que limita a esas campañas, con sus valores. */
+const filtroCampanas = (ids, columna) => (ids === null
+  ? { sql: '', val: [] }
+  : ids.length
+    ? { sql: ` AND ${columna} IN (${ids.map(() => '?').join(',')})`, val: ids }
+    : { sql: ' AND 1 = 0', val: [] });
+
+/**
+ * Quién está esperando en las colas de esas campañas.
+ *
+ * QueueStatus devuelve un evento por cada persona en espera. Cada
+ * campaña sabe cuál es su cola por `cola_asterisk`. Nunca lanza: un
+ * fallo de la cola no puede tumbar el resto del panel.
+ */
+async function colasDe(ids) {
+  try {
+    if (!ami.estado().conectado) return { ok: false, motivo: 'Sin conexión con la central' };
+
+    const f = filtroCampanas(ids, 'id');
+    const campanas = await bd.consultar(
+      `SELECT id, nombre, cola_asterisk FROM campana
+        WHERE activa = TRUE AND cola_asterisk IS NOT NULL AND cola_asterisk <> ''${f.sql}`, f.val);
+    const porCola = new Map(campanas.map((c) => [String(c.cola_asterisk), c]));
+    if (!porCola.size) return { ok: true, total: 0, colas: [] };
+
+    const esperando = await ami.listar(
+      { Action: 'QueueStatus' }, 'QueueEntry', 'QueueStatusComplete');
+
+    const colas = new Map();
+    esperando.forEach((e) => {
+      const c = porCola.get(String(e.Queue));
+      if (!c) return;
+      if (!colas.has(c.id)) colas.set(c.id, { campana: c.nombre, cola: e.Queue, llamadas: [] });
+      colas.get(c.id).llamadas.push({
+        numero: e.CallerIDNum || e.CallerID || 'Desconocido',
+        esperando: Number(e.Wait) || 0,
+        posicion: Number(e.Position) || 0,
+      });
+    });
+
+    const lista = [...colas.values()].map((c) => ({
+      ...c,
+      total: c.llamadas.length,
+      maxEspera: Math.max(...c.llamadas.map((l) => l.esperando)),
+      llamadas: c.llamadas.sort((a, b) => a.posicion - b.posicion).slice(0, 10),
+    })).sort((a, b) => b.maxEspera - a.maxEspera);
+
+    return { ok: true, total: lista.reduce((s, c) => s + c.total, 0), colas: lista };
+  } catch {
+    return { ok: false, motivo: 'No se pudo consultar la cola' };
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════
    GET /api/vivo
    ═══════════════════════════════════════════════════════════════════ */
@@ -79,22 +156,7 @@ function interpretarCanales(texto) {
    tiene a quién mirar. */
 router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, res, next) => {
   try {
-    /* ── Qué campañas puede ver quien pregunta ───────────────────── */
-    const esAdmin = req.usuario.rol === 'admin';
-
-    let campanasVisibles = null;               // null = todas
-    if (!esAdmin) {
-      const filas = await bd.consultar(
-        'SELECT campana_id FROM usuario_campana WHERE usuario_id = ?', [req.usuario.id]);
-      campanasVisibles = filas.map((f) => f.campana_id);
-
-      /* Sin campañas asignadas, ve la suya propia. Así un supervisor
-         recién creado no se encuentra la pantalla vacía. */
-      if (!campanasVisibles.length) {
-        const yo = await bd.una('SELECT campana_id FROM usuario WHERE id = ?', [req.usuario.id]);
-        if (yo?.campana_id) campanasVisibles = [yo.campana_id];
-      }
-    }
+    const visibles = await campanasVisibles(req.usuario);
 
     /* ── Agentes con sesión abierta ──────────────────────────────── */
     const agentes = await bd.consultar(
@@ -108,6 +170,10 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
                  JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
                 WHERE p.usuario_id = u.id AND p.fin IS NULL
                 ORDER BY p.inicio DESC LIMIT 1) AS pausa_motivo,
+              (SELECT pt.limite_minutos FROM pausa p
+                 JOIN pausa_tipo pt ON pt.id = p.pausa_tipo_id
+                WHERE p.usuario_id = u.id AND p.fin IS NULL
+                ORDER BY p.inicio DESC LIMIT 1) AS pausa_limite,
               (SELECT p.inicio FROM pausa p
                 WHERE p.usuario_id = u.id AND p.fin IS NULL
                 ORDER BY p.inicio DESC LIMIT 1) AS pausa_desde
@@ -132,19 +198,44 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
       if (!previo || c.segundos > previo.segundos) porExtension[c.extension] = c;
     });
 
+    /* ── Lo que lleva cada agente hoy ────────────────────────────
+       Una sola consulta para todos, agrupada: preguntar agente por
+       agente serían decenas de viajes a la base cada tres segundos. */
+    const delDia = new Map();
+    try {
+      const filas = await bd.consultar(
+        `SELECT usuario_id, COUNT(*) AS llamadas,
+                SUM(contestada = 1) AS contestadas,
+                SUM(IFNULL(segundos_total, 0)) AS segundos
+           FROM interaccion
+          WHERE inicio >= CURDATE()
+          GROUP BY usuario_id`);
+      filas.forEach((f) => delDia.set(f.usuario_id, {
+        llamadas: Number(f.llamadas) || 0,
+        contestadas: Number(f.contestadas) || 0,
+        segundos: Number(f.segundos) || 0,
+      }));
+    } catch { /* sin datos del día: las tarjetas los muestran en cero */ }
+
     const ahora = Date.now();
 
     let lista = agentes.map((a) => {
       const canal = a.extension ? porExtension[a.extension] : null;
 
-      let estado, desde;
+      /* `tipo` es para la pantalla —colores, alertas, orden—; `estado`
+         es el texto que se lee, como antes. */
+      let estado, tipo, desde, limite = null;
       if (canal) {
+        tipo = canal.estado === 'Up' ? 'llamada' : 'timbrando';
         estado = canal.estado === 'Up' ? 'En llamada' : 'Timbrando';
         desde = canal.segundos;
       } else if (a.pausa_id) {
+        tipo = 'pausa';
         estado = a.pausa_motivo || 'En pausa';
         desde = Math.floor((ahora - new Date(a.pausa_desde).getTime()) / 1000);
+        limite = a.pausa_limite ? Number(a.pausa_limite) * 60 : null;
       } else {
+        tipo = 'disponible';
         estado = 'Disponible';
         desde = Math.floor((ahora - new Date(a.desde_sesion).getTime()) / 1000);
       }
@@ -157,28 +248,36 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
         campana: a.campana || '—',
         campana_id: a.campana_id,
         estado,
+        tipo,
         desde: desde < 0 ? 0 : desde,
+        limite,
         numero: canal ? canal.numero : null,
+        hoy: delDia.get(a.id) || { llamadas: 0, contestadas: 0, segundos: 0 },
       };
     });
 
-    if (campanasVisibles) {
-      lista = lista.filter((a) => campanasVisibles.includes(a.campana_id));
+    if (visibles) {
+      lista = lista.filter((a) => visibles.includes(a.campana_id));
     }
 
     /* ── Indicadores ─────────────────────────────────────────────── */
-    const enLlamada = lista.filter((a) => a.estado === 'En llamada').length;
-    const disponibles = lista.filter((a) => a.estado === 'Disponible').length;
-    const enPausa = lista.length - enLlamada - disponibles -
-                    lista.filter((a) => a.estado === 'Timbrando').length;
+    const enLlamada = lista.filter((a) => a.tipo === 'llamada').length;
+    const disponibles = lista.filter((a) => a.tipo === 'disponible').length;
+    const enPausa = lista.filter((a) => a.tipo === 'pausa').length;
 
-    /* ── Llamadas del día, de la base ────────────────────────────── */
+    /* ── Llamadas del día, de la base ────────────────────────────
+       Solo las de las campañas que ve quien pregunta. Antes contaba las
+       de toda la operación, y un supervisor veía números que no eran
+       los de sus campañas. */
+    const fd = filtroCampanas(visibles, 'campana_id');
     const hoy = await bd.una(
       `SELECT COUNT(*) AS total,
               SUM(contestada = 1) AS contestadas,
               SUM(contestada = 0) AS abandonadas
          FROM interaccion
-        WHERE DATE(inicio) = CURDATE()`).catch(() => null);
+        WHERE inicio >= CURDATE()${fd.sql}`, fd.val).catch(() => null);
+
+    const cola = await colasDe(visibles);
 
     res.json({
       momento: new Date(),
@@ -187,11 +286,12 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
         conectados: lista.length,
         enLlamada,
         disponibles,
-        enPausa: enPausa < 0 ? 0 : enPausa,
-        llamadasHoy: hoy?.total || 0,
-        contestadasHoy: hoy?.contestadas || 0,
-        abandonadasHoy: hoy?.abandonadas || 0,
+        enPausa,
+        llamadasHoy: Number(hoy?.total) || 0,
+        contestadasHoy: Number(hoy?.contestadas) || 0,
+        abandonadasHoy: Number(hoy?.abandonadas) || 0,
       },
+      cola,
       /* Si no se pudo consultar a Asterisk, se dice. El supervisor
          verá los agentes conectados pero no quién está en llamada, y
          es mejor que lo sepa a que lo deduzca. */
@@ -199,6 +299,36 @@ router.get('/vivo', auth.exigirSesion, auth.exigir('supervision'), async (req, r
         ? { ok: true, canales: canales.length }
         : { ok: false, motivo: cli.motivo },
     });
+  } catch (e) { next(e); }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   GET /api/vivo/horas
+
+   Cuántas llamadas hubo en cada hora, hoy y ayer, para el gráfico del
+   día. Se pide cada minuto, no cada tres segundos: el dato cambia
+   despacio y la consulta recorre todas las llamadas de dos días.
+   ═══════════════════════════════════════════════════════════════════ */
+router.get('/vivo/horas', auth.exigirSesion, auth.exigir('supervision'), async (req, res, next) => {
+  try {
+    const visibles = await campanasVisibles(req.usuario);
+    const f = filtroCampanas(visibles, 'campana_id');
+
+    const filas = await bd.consultar(
+      `SELECT DATE(inicio) = CURDATE() AS es_hoy, HOUR(inicio) AS hora,
+              COUNT(*) AS llamadas, SUM(contestada = 1) AS contestadas
+         FROM interaccion
+        WHERE inicio >= SUBDATE(CURDATE(), 1)${f.sql}
+        GROUP BY es_hoy, hora`, f.val);
+
+    const vacio = () => Array.from({ length: 24 }, () => ({ llamadas: 0, contestadas: 0 }));
+    const hoy = vacio(), ayer = vacio();
+    filas.forEach((x) => {
+      const dia = Number(x.es_hoy) ? hoy : ayer;
+      dia[Number(x.hora)] = { llamadas: Number(x.llamadas) || 0, contestadas: Number(x.contestadas) || 0 };
+    });
+
+    res.json({ hoy, ayer, horaActual: new Date().getHours() });
   } catch (e) { next(e); }
 });
 
