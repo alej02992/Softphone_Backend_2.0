@@ -337,4 +337,58 @@ router.get('/vivo/horas', auth.exigirSesion, auth.exigir('supervision'), async (
   } catch (e) { next(e); }
 });
 
+/* ═══════════════════════════════════════════════════════════════════
+   GET /api/escuchas/recientes?dias=7
+
+   Quién escuchó a quién y cuándo. Cada escucha se guarda en la tabla
+   auditoria al momento de autorizarla (entidad "escucha", con el id
+   del agente escuchado); esto solo la lee.
+
+   El administrador ve todas. Un supervisor, las que se hicieron a
+   agentes de sus campañas, sin importar quién escuchó: así ve también
+   si otro supervisor escuchó a su gente.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* El texto que se guardó dice el modo: "escuchó a Ana (extensión 1011)" */
+const MODO_ESCUCHA = [
+  [/^escuchó a /, 'Escuchó'],
+  [/^susurró a /, 'Susurró'],
+  [/^entró a la llamada de /, 'Entró a la llamada'],
+];
+
+router.get('/escuchas/recientes', auth.exigirSesion, auth.exigir('escucha'), async (req, res, next) => {
+  try {
+    /* Hoy, la última semana o el último mes. Nada más largo: para eso
+       está la base de datos, y una lista de miles no la lee nadie. */
+    const dias = [1, 7, 30].includes(Number(req.query.dias)) ? Number(req.query.dias) : 7;
+    const desde = dias === 1 ? 'CURDATE()' : `CURDATE() - INTERVAL ${dias - 1} DAY`;
+
+    const visibles = await campanasVisibles(req.usuario);
+    const f = filtroCampanas(visibles, 'ag.campana_id');
+
+    const filas = await bd.consultar(
+      `SELECT a.fecha, a.detalle, s.nombre AS supervisor,
+              ag.nombre AS agente, ag.extension, c.nombre AS campana
+         FROM auditoria a
+         LEFT JOIN usuario s  ON s.id = a.usuario_id
+         LEFT JOIN usuario ag ON ag.id = a.entidad_id
+         LEFT JOIN campana c  ON c.id = ag.campana_id
+        WHERE a.entidad = 'escucha' AND a.fecha >= ${desde}${f.sql}
+        ORDER BY a.fecha DESC
+        LIMIT 300`, f.val);
+
+    res.json({
+      dias,
+      escuchas: filas.map((x) => ({
+        fecha: x.fecha,
+        supervisor: x.supervisor || '—',
+        agente: x.agente || '—',
+        extension: x.extension,
+        campana: x.campana || '—',
+        modo: (MODO_ESCUCHA.find(([re]) => re.test(x.detalle || '')) || [, 'Escuchó'])[1],
+      })),
+    });
+  } catch (e) { next(e); }
+});
+
 module.exports = router;
