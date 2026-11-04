@@ -31,7 +31,8 @@ let ultima = { momento: null, cambios: 0, error: null };
 /** Quién debería estar en qué cola, y si en pausa. */
 async function deseado() {
   /* Solo agentes: los supervisores tienen extensión para escuchar, pero
-     no atienden llamadas. Igual que la marcación progresiva. */
+     no atienden llamadas. El criterio es el mismo de la marcación
+     progresiva: supervisor es quien tiene el permiso de supervisión. */
   const filas = await bd.consultar(
     `SELECT u.id, u.nombre, u.extension, c.cola_asterisk AS cola,
             EXISTS(SELECT 1 FROM pausa p WHERE p.usuario_id = u.id AND p.fin IS NULL) AS en_pausa
@@ -39,7 +40,11 @@ async function deseado() {
        JOIN usuario u ON u.id = s.usuario_id
        JOIN campana c ON c.id = u.campana_id
       WHERE s.cerrada IS NULL AND s.vence > NOW()
-        AND u.activo = TRUE AND u.rol = 'agente'
+        AND u.activo = TRUE
+        AND NOT EXISTS (
+          SELECT 1 FROM rol_permiso rp
+            JOIN permiso pe ON pe.id = rp.permiso_id
+           WHERE rp.rol_id = u.rol_id AND pe.clave = 'supervision')
         AND u.extension IS NOT NULL AND u.extension <> ''
         AND c.activa = TRUE AND c.cola_asterisk IS NOT NULL AND c.cola_asterisk <> ''
       GROUP BY u.id`);
@@ -110,9 +115,14 @@ async function sincronizar() {
       if (ok(r)) { cambios++; console.log(`  Colas            ${h.interfaz} sale de ${h.cola}`); }
     }
 
+    if (ultima.error) console.log('  Colas            sincroniza de nuevo con normalidad');
     ultima = { momento: new Date(), cambios, error: null };
   } catch (e) {
+    /* Un error no tumba el servidor, pero tampoco puede quedar callado:
+       se escribe en el registro, una vez, y otra vez cuando se resuelve. */
+    if (ultima.error !== e.message) console.error(`  Colas            no se pudo sincronizar: ${e.message}`);
     ultima = { momento: new Date(), cambios, error: e.message };
+    return cambios;
   } finally {
     trabajando = false;
   }
