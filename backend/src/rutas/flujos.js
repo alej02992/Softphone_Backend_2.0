@@ -4,9 +4,10 @@
    Guarda los flujos que se dibujan en el lienzo: qué bloques tienen,
    cómo están configurados, dónde están y cómo se unen.
 
-   Todavía no toca Asterisk. En la fase 2 un flujo "activo" se traducirá
-   a plan de marcación; por eso aquí ya se guarda cuántos pendientes
-   tiene, para saber cuáles están listos.
+   Un flujo "activo" se traduce a plan de marcación y la central lo usa
+   (flujos-asterisk.js). Se prueba marcando *77 más su número desde
+   cualquier extensión. Si la central rechaza el cambio, todo vuelve a
+   como estaba.
 
    Solo para administradores: es el mismo permiso que usuarios y
    troncales, porque un flujo decide a dónde va cada llamada que entra.
@@ -15,6 +16,7 @@
 const express = require('express');
 const bd = require('../bd');
 const auth = require('../auth');
+const central = require('../flujos-asterisk');
 
 const router = express.Router();
 
@@ -167,11 +169,32 @@ router.put('/flujos/:id', auth.exigirSesion, auth.exigir('usuarios'),
 
       const pendientes = Math.max(0, Math.min(999, Number(req.body?.pendientes) || 0));
 
+      /* Un flujo activo está atendiendo llamadas: no puede quedar a medias */
+      if (f.estado === 'activo') {
+        const r = await central.revisar(diseno);
+        if (r.errores.length) {
+          return res.status(409).json({
+            error: 'Este flujo está activo y quedaría incompleto. Corrige esto o desactívalo antes: ' +
+                   r.errores.slice(0, 3).join(' · '), errores: r.errores });
+        }
+      }
+
+      const anterior = await bd.una('SELECT diseno FROM flujo WHERE id = ?', [id]);
       await bd.consultar(
         `UPDATE flujo SET nombre = ?, descripcion = ?, diseno = ?, pendientes = ?, modificado_por = ?
           WHERE id = ?`,
         [v.nombre, String(req.body?.descripcion || '').slice(0, 200) || null,
          JSON.stringify(diseno), pendientes, req.usuario.id, id]);
+
+      if (f.estado === 'activo') {
+        try {
+          await central.publicar();
+        } catch (e) {
+          /* La central no lo aceptó: se devuelve el diseño anterior */
+          await bd.consultar('UPDATE flujo SET diseno = ? WHERE id = ?', [anterior.diseno, id]);
+          return res.status(502).json({ error: e.message });
+        }
+      }
 
       await auth.auditar(req.usuario.id, 'modificar', 'flujo', id,
         `Guardó el flujo ${v.nombre} (${diseno.nodos.length} bloques)`, req.ip);
@@ -225,6 +248,55 @@ router.delete('/flujos/:id', auth.exigirSesion, auth.exigir('usuarios'),
 
       await bd.consultar('DELETE FROM flujo WHERE id = ?', [id]);
       await auth.auditar(req.usuario.id, 'eliminar', 'flujo', id, `Eliminó el flujo ${f.nombre}`, req.ip);
+      res.json({ ok: true });
+    } catch (e) { next(e); }
+  });
+
+/* ═══════════ ACTIVAR Y DESACTIVAR ═══════════
+   Activar: se revisa contra lo que existe de verdad, se traduce y se
+   recarga la central. Si algo falla, el flujo queda como estaba.      */
+
+router.post('/flujos/:id/activar', auth.exigirSesion, auth.exigir('usuarios'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const f = await bd.una('SELECT nombre, diseno, estado FROM flujo WHERE id = ?', [id]);
+      if (!f) return res.status(404).json({ error: 'Ese flujo no existe' });
+
+      const r = await central.revisar(leerDiseno(f.diseno));
+      if (r.errores.length) {
+        return res.status(400).json({ error: 'Todavía no se puede activar', errores: r.errores });
+      }
+
+      await bd.consultar("UPDATE flujo SET estado = 'activo' WHERE id = ?", [id]);
+      try {
+        await central.publicar();
+      } catch (e) {
+        await bd.consultar('UPDATE flujo SET estado = ? WHERE id = ?', [f.estado, id]);
+        return res.status(502).json({ error: e.message });
+      }
+
+      await auth.auditar(req.usuario.id, 'modificar', 'flujo', id, `Activó el flujo ${f.nombre}`, req.ip);
+      res.json({ ok: true, prueba: `${central.PREFIJO_PRUEBA}${id}` });
+    } catch (e) { next(e); }
+  });
+
+router.post('/flujos/:id/desactivar', auth.exigirSesion, auth.exigir('usuarios'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const f = await bd.una('SELECT nombre, estado FROM flujo WHERE id = ?', [id]);
+      if (!f) return res.status(404).json({ error: 'Ese flujo no existe' });
+
+      await bd.consultar("UPDATE flujo SET estado = 'borrador' WHERE id = ?", [id]);
+      try {
+        await central.publicar();
+      } catch (e) {
+        await bd.consultar("UPDATE flujo SET estado = 'activo' WHERE id = ?", [id]);
+        return res.status(502).json({ error: e.message });
+      }
+
+      await auth.auditar(req.usuario.id, 'modificar', 'flujo', id, `Desactivó el flujo ${f.nombre}`, req.ip);
       res.json({ ok: true });
     } catch (e) { next(e); }
   });
