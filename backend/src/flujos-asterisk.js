@@ -64,7 +64,9 @@ async function revisar(diseno) {
       if (!salida(n.id, 'siguiente')) errores.push('Reproducir: la salida no va a ningún lado');
     }
     if (n.tipo === 'menu') {
-      if (!audioExiste(c.audio)) errores.push(`Menú: el audio "${c.audio || '—'}" no existe en la central`);
+      /* El audio del menú es opcional: sin él, el menú espera la tecla en
+         silencio (por si el mensaje ya sonó antes). Si lo tiene, debe existir. */
+      if (c.audio && !audioExiste(c.audio)) errores.push(`Menú: el audio "${c.audio}" no existe en la central`);
       const ops = c.opciones || [];
       if (!ops.length) errores.push('Menú: no tiene opciones');
       ops.forEach((o) => {
@@ -147,7 +149,7 @@ function traducir(flujoId, diseno, campanas) {
       const intentos = entero(c.intentos, 1, 5, 3);
       L.push(`exten => ${b},1,Set(INT_${b}=0)`,
         ` same => n(leer),Set(INT_${b}=$[\${INT_${b}} + 1])`,
-        ` same => n,Read(OP_${b},${audio(c.audio)},1,,1,${espera})`);
+        ` same => n,Read(OP_${b},${c.audio ? audio(c.audio) : ''},1,,1,${espera})`);
       (c.opciones || []).filter((o) => /^[0-9*]$/.test(String(o.tecla))).forEach((o) => {
         L.push(` same => n,GotoIf($["\${OP_${b}}" = "${o.tecla}"]?${ir(n.id, 'op' + o.tecla)})`);
       });
@@ -212,6 +214,9 @@ async function publicar() {
     '',
     '; Probar un flujo sin número de entrada: marcar *77 + su número',
     '[bpm-flujos-prueba]',
+    /* Dos patrones: "X" para los flujos 1 a 9, y "X." para los de dos
+       cifras o más. "X." solo exige al menos dos dígitos. */
+    `exten => _${PREFIJO_PRUEBA}X,1,Goto(bpm-flujo-\${EXTEN:${PREFIJO_PRUEBA.length}},s,1)`,
     `exten => _${PREFIJO_PRUEBA}X.,1,Goto(bpm-flujo-\${EXTEN:${PREFIJO_PRUEBA.length}},s,1)`,
     '',
     '; Llamadas que entran por las troncales. Mientras no haya números',
