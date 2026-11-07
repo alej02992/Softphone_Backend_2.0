@@ -67,7 +67,9 @@ async function blastersActivos() {
   return bd.consultar(
     `SELECT id, nombre, campana_id, tipo, guion, audio_archivo, voz_id,
             respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
-            respuesta_digitos, reintentos, intervalo_min
+            respuesta_digitos, reintentos, intervalo_min,
+            transferir_tecla, transferir_espera, transferir_audio,
+            (SELECT c.cola_asterisk FROM campana c WHERE c.id = blaster.campana_id) AS cola
        FROM blaster
       WHERE estado = 'activo'
         AND aprobado = TRUE
@@ -81,6 +83,39 @@ async function enCurso() {
     "SELECT COUNT(*) AS n FROM blaster_destinatario WHERE estado = 'llamando'");
   return Number(r.n) || 0;
 }
+
+/** Cuántas llamadas de UN blaster están en curso. */
+async function enCursoDe(blasterId) {
+  const r = await bd.una(
+    "SELECT COUNT(*) AS n FROM blaster_destinatario WHERE blaster_id = ? AND estado = 'llamando'", [blasterId]);
+  return Number(r.n) || 0;
+}
+
+/* ═══════════ TRANSFERIR A UN ASESOR ═══════════
+   Un blaster con transferencia marca según los asesores LIBRES de su
+   campaña: si no hay ninguno, espera; si hay tres, hasta seis llamadas
+   a la vez. Así no se acumulan clientes esperando en la cola.
+
+   Libre = en la cola, sin pausa y sin estar en una llamada (estado 1
+   de la central: "no en uso").                                        */
+const POR_AGENTE = Number(process.env.BLASTER_POR_AGENTE) || 2;
+const transfiere = (b) => !!(b.transferir_tecla && b.cola);
+
+async function agentesLibres(cola) {
+  try {
+    const miembros = await ami.listar({ Action: 'QueueStatus', Queue: cola }, 'QueueMember', 'QueueStatusComplete');
+    return miembros.filter((m) => String(m.Queue) === String(cola)
+      && String(m.Paused) !== '1' && String(m.Status) === '1').length;
+  } catch { return 0; }
+}
+
+/* Para no llenar el registro, el aviso de "esperando asesores" se
+   escribe una vez por blaster hasta que vuelva a haber libres. */
+const esperandoAsesores = new Set();
+
+/** El nombre que verá el agente: "Blaster · Recordatorio de pago" */
+const nombreParaAgente = (b) =>
+  ('Blaster · ' + String(b.nombre || '')).replace(/[^\p{L}\p{N} ·._-]/gu, '').slice(0, 40);
 
 /* ═══════════ EL AUDIO DE CADA DESTINATARIO ═══════════ */
 
@@ -184,11 +219,24 @@ async function llamar(b, d) {
       audio,
       /* Si se pide respuesta, cuántas teclas escuchar: una sola para
          "marque 1 o 2", o varias para "digite su documento". */
-      digitos: !b.respuesta ? 0
-        : b.respuesta_tipo === 'numero' ? (b.respuesta_digitos || 10) : 1,
+      /* Con transferencia siempre se escucha al menos una tecla */
+      digitos: transfiere(b) && (!b.respuesta || b.respuesta_tipo !== 'numero')
+        ? 1
+        : !b.respuesta ? 0
+          : b.respuesta_tipo === 'numero' ? (b.respuesta_digitos || 10) : 1,
       identificador: `blaster-${d.id}`,
       contextoSalida: CONFIG.blaster?.contextoSalida || 'from-internal',
       ruta: await rutaDe(b.campana_id),
+      extra: transfiere(b) ? {
+        BPM_TRANSFER: b.transferir_tecla,
+        BPM_COLA: b.cola,
+        BPM_ESPERA: Math.min(600, Math.max(15, Number(b.transferir_espera) || 60)),
+        BPM_NUMERO: String(d.numero).replace(/[^\d+]/g, ''),
+        BPM_NOMBRE: nombreParaAgente(b),
+        BPM_OCUPADO: b.transferir_audio
+          ? path.join(voz.CARPETA, path.basename(b.transferir_audio)).replace(/\.(wav|ulaw|alaw|gsm|sln|mp3)$/i, '')
+          : '',
+      } : {},
     });
 
     if (resp?.ActionID) enVuelo.set(resp.ActionID, d.id);
@@ -311,6 +359,43 @@ async function alResponderCliente(e) {
   anotar(`Respuesta de ${d.numero}: ${final}`);
 }
 
+/* ═══════════ EL RESULTADO DE LA TRANSFERENCIA ═══════════
+   La central avisa con BlasterTransferencia cuando el cliente pidió un
+   asesor ("pedida") y cuando nadie lo atendió ("sin_agente"). Cuando un
+   asesor contesta, avisa con AgentConnect, que trae el mismo canal: por
+   eso al pedirla se guarda qué canal es de qué destinatario.           */
+const transferidos = new Map();          // Uniqueid del canal → destinatario
+
+async function alTransferir(e) {
+  const m = /^blaster-(\d+)$/.exec(String(e.Id || ''));
+  if (!m) return;
+  const id = Number(m[1]);
+  const estadoT = String(e.Estado || '');
+  if (estadoT === 'pedida') {
+    if (e.Uniqueid) transferidos.set(String(e.Uniqueid), id);
+    await bd.consultar(
+      "UPDATE blaster_destinatario SET transferencia = 'pedida', transferencia_en = NOW() WHERE id = ?", [id]);
+    anotar(`Destinatario ${id}: pidió un asesor`);
+  }
+  if (estadoT === 'sin_agente') {
+    await bd.consultar(
+      "UPDATE blaster_destinatario SET transferencia = 'sin_agente' WHERE id = ? AND transferencia = 'pedida'", [id]);
+    anotar(`Destinatario ${id}: no alcanzó asesor (${e.Motivo || 'sin motivo'})`);
+  }
+}
+
+async function alConectarAgente(e) {
+  const id = transferidos.get(String(e.Uniqueid || ''));
+  if (!id) return;
+  transferidos.delete(String(e.Uniqueid));
+  const ext = /^PJSIP\/(\w+)/.exec(String(e.Interface || e.MemberName || ''))?.[1];
+  const agente = ext ? await bd.una('SELECT id, nombre FROM usuario WHERE extension = ?', [ext]) : null;
+  await bd.consultar(
+    "UPDATE blaster_destinatario SET transferencia = 'atendida', transferencia_agente_id = ? WHERE id = ?",
+    [agente?.id || null, id]);
+  anotar(`Destinatario ${id}: lo atendió ${agente?.nombre || ext || 'un asesor'}`);
+}
+
 /* ═══════════ LIMPIEZA ═══════════ */
 
 /** Las que quedaron "llamando" sin respuesta de la central. */
@@ -353,6 +438,20 @@ async function vuelta() {
     for (const b of await blastersActivos()) {
       if (libres <= 0) break;
 
+      let tope = libres;
+      if (transfiere(b)) {
+        const asesores = await agentesLibres(b.cola);
+        tope = Math.min(libres, asesores * POR_AGENTE - await enCursoDe(b.id));
+        if (tope <= 0) {
+          if (!esperandoAsesores.has(b.id)) {
+            anotar(`${b.nombre}: esperando asesores libres en ${b.cola} para seguir marcando`);
+            esperandoAsesores.add(b.id);
+          }
+          continue;
+        }
+        esperandoAsesores.delete(b.id);
+      }
+
       const destinos = await bd.consultar(
         `SELECT id, numero, nombre, datos, audio_archivo
            FROM blaster_destinatario
@@ -360,7 +459,7 @@ async function vuelta() {
             AND (proximo_intento IS NULL OR proximo_intento <= NOW())
             AND numero NOT IN (SELECT numero FROM no_llamar)
           ORDER BY id
-          LIMIT ?`, [b.id, libres]);
+          LIMIT ?`, [b.id, tope]);
 
       for (const d of destinos) {
         await llamar(b, d);
@@ -386,6 +485,8 @@ function arrancar() {
     if (e.Event === 'UserEvent' && e.UserEvent === 'BlasterRespuesta') {
       alResponderCliente(e).catch(() => {});
     }
+    if (e.Event === 'UserEvent' && e.UserEvent === 'BlasterTransferencia') alTransferir(e).catch(() => {});
+    if (e.Event === 'AgentConnect') alConectarAgente(e).catch(() => {});
   });
 
   reloj = setInterval(vuelta, CICLO_MS);

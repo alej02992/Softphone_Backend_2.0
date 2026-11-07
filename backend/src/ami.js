@@ -282,7 +282,12 @@ class Ami extends EventEmitter {
    * suya, que ya está probada.
    */
   originarBlaster({ numero, audio, digitos = 0, identificador, espera = 40,
-                    contextoSalida = 'from-internal', identificadorLlamada, ruta }) {
+                    contextoSalida = 'from-internal', identificadorLlamada, ruta, extra = {} }) {
+    /* Variables extra del blaster (la transferencia a un asesor). Solo
+       pasan las que empiezan por BPM_ y tienen nombre conocido: nada que
+       llegue de afuera puede inventar una variable de la central. */
+    const permitidas = ['BPM_TRANSFER', 'BPM_COLA', 'BPM_ESPERA', 'BPM_NUMERO', 'BPM_NOMBRE', 'BPM_OCUPADO'];
+    const extras = Object.fromEntries(Object.entries(extra).filter(([k]) => permitidas.includes(k)));
     /* RUTA dice por qué troncal sale y con qué prefijo: "troncal/prefijo".
        Lleva dos guiones bajos delante para que pase al otro lado del
        canal Local, que es el que marca: sin ellos, el plan de marcación
@@ -292,6 +297,7 @@ class Ami extends EventEmitter {
       BPM_DIGITOS: digitos,
       BPM_ID: identificador || '',
       __RUTA: ruta || '',
+      ...extras,
     })
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
       .map(([k, v]) => `${k}=${String(v).replace(/[\r\n,]/g, ' ')}`)

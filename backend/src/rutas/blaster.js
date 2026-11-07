@@ -208,8 +208,27 @@ function revisarConfiguracion(b) {
       if (!d || d < 1 || d > 20) return 'La cantidad de dígitos debe estar entre 1 y 20';
     }
   }
+
+  /* Transferir a un asesor: una tecla, que no choque con lo demás */
+  if (b.transferir_tecla) {
+    const t = String(b.transferir_tecla);
+    if (!/^[0-9*]$/.test(t)) return 'La tecla para hablar con un asesor debe ser un dígito o *';
+    if (b.respuesta && b.respuesta_tipo === 'numero') {
+      return 'Un blaster que pide un número (como el documento) no puede transferir con una tecla';
+    }
+    const espera = Number(b.transferir_espera ?? 60);
+    if (!(espera >= 15 && espera <= 600)) return 'La espera por un asesor va de 15 a 600 segundos';
+    if (b.transferir_audio && !/^[\w.-]{1,160}$/.test(String(b.transferir_audio))) {
+      return 'El audio de "asesores ocupados" no es válido';
+    }
+  }
   return null;
 }
+
+/** Los valores de la transferencia, listos para guardar */
+const transferencia = (b) => (b.transferir_tecla
+  ? [String(b.transferir_tecla), Number(b.transferir_espera ?? 60), b.transferir_audio || null]
+  : [null, 60, null]);
 
 router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, res, next) => {
   try {
@@ -225,15 +244,16 @@ router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, 
          (nombre, campana_id, tipo, guion, audio_archivo, voz_id,
           respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
           respuesta_etiquetas, respuesta_digitos,
-          hora_inicio, hora_fin, dias, reintentos, creado_por)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          hora_inicio, hora_fin, dias, reintentos, creado_por,
+          transferir_tecla, transferir_espera, transferir_audio)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.tipo || 'texto',
        b.guion || null, b.audio_archivo || null, b.voz_id || null,
        !!b.respuesta, b.respuesta_tipo || 'tecla',
        b.tipo === 'audio' ? null : (b.respuesta_guion || null),
        b.respuesta_opciones || null, etiquetasLimpias(b), b.respuesta_digitos || 10,
        b.hora_inicio || '08:00:00', b.hora_fin || '18:00:00',
-       b.dias || 'L,M,X,J,V', b.reintentos ?? 2, req.usuario.id]);
+       b.dias || 'L,M,X,J,V', b.reintentos ?? 2, req.usuario.id, ...transferencia(b)]);
 
     await auth.auditar(req.usuario.id, 'crear', 'blaster', r.insertId,
       `Creó el blaster "${b.nombre}"`, req.ip);
@@ -267,13 +287,14 @@ router.put('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async (re
               respuesta = ?, respuesta_tipo = ?, respuesta_guion = ?,
               respuesta_opciones = ?, respuesta_etiquetas = ?, respuesta_digitos = ?,
               hora_inicio = ?, hora_fin = ?, dias = ?, reintentos = ?,
+              transferir_tecla = ?, transferir_espera = ?, transferir_audio = ?,
               estado = 'borrador'
         WHERE id = ?`,
       [String(b.nombre).trim(), b.tipo, b.guion || null, b.audio_archivo || null, b.voz_id || null,
        !!b.respuesta, b.respuesta_tipo || 'tecla',
        b.tipo === 'audio' ? null : (b.respuesta_guion || null),
        b.respuesta_opciones || null, etiquetasLimpias(b), b.respuesta_digitos || 10,
-       b.hora_inicio, b.hora_fin, b.dias, b.reintentos, id]);
+       b.hora_inicio, b.hora_fin, b.dias, b.reintentos, ...transferencia(b), id]);
 
     await auth.auditar(req.usuario.id, 'modificar', 'blaster', id,
       `Modificó el blaster "${b.nombre}"`, req.ip);
@@ -432,9 +453,12 @@ router.get('/blasters/:id/destinos', auth.exigirSesion, auth.exigir('blaster'),
       if (no) return res.status(403).json({ error: no });
 
       const filas = await bd.consultar(
-        `SELECT id, numero, nombre, estado, intentos, ultimo_intento, proximo_intento,
-                ultimo_motivo, segundos_escuchados, datos, audio_archivo
-           FROM blaster_destinatario WHERE blaster_id = ? ORDER BY id LIMIT 2000`, [id]);
+        `SELECT d.id, d.numero, d.nombre, d.estado, d.intentos, d.ultimo_intento, d.proximo_intento,
+                d.ultimo_motivo, d.segundos_escuchados, d.datos, d.audio_archivo,
+                d.transferencia, u.nombre AS asesor
+           FROM blaster_destinatario d
+           LEFT JOIN usuario u ON u.id = d.transferencia_agente_id
+          WHERE d.blaster_id = ? ORDER BY d.id LIMIT 2000`, [id]);
 
       /* Con variables, cada persona escucha un mensaje distinto. Se manda
          ya armado con sus datos: leyéndolo se detecta un nombre mal
@@ -610,6 +634,13 @@ router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster'),
 
         if (b.tipo === 'audio' && !b.audio_archivo) {
           return res.status(400).json({ error: 'Falta el audio grabado' });
+        }
+        if (b.transferir_tecla) {
+          const c = await bd.una('SELECT nombre, cola_asterisk FROM campana WHERE id = ?', [b.campana_id]);
+          if (!c?.cola_asterisk) {
+            return res.status(400).json({
+              error: `Para transferir a un asesor, la campaña ${c?.nombre || ''} necesita una cola en la central` });
+          }
         }
         if (b.tipo === 'texto' && !b.audio_archivo) {
           return res.status(400).json({ error: 'Genera primero el audio del mensaje' });
