@@ -218,17 +218,34 @@ function revisarConfiguracion(b) {
     }
     const espera = Number(b.transferir_espera ?? 60);
     if (!(espera >= 15 && espera <= 600)) return 'La espera por un asesor va de 15 a 600 segundos';
-    if (b.transferir_audio && !/^[\w.-]{1,160}$/.test(String(b.transferir_audio))) {
-      return 'El audio de "asesores ocupados" no es válido';
+    /* El aviso de "asesores ocupados" es opcional. Con audio grabado se
+       elige un audio; con texto a voz se escribe, y se genera al aprobar. */
+    if (b.tipo === 'audio') {
+      if (b.transferir_audio && !/^[\w.-]{1,160}$/.test(String(b.transferir_audio))) {
+        return 'El audio de "asesores ocupados" no es válido';
+      }
+    } else if (b.transferir_texto) {
+      const t = String(b.transferir_texto).trim();
+      if (t.length < 5) return 'El aviso de "asesores ocupados" es demasiado corto';
+      if (t.length > 300) return 'El aviso de "asesores ocupados" puede tener hasta 300 caracteres';
     }
   }
   return null;
 }
 
 /** Los valores de la transferencia, listos para guardar */
-const transferencia = (b) => (b.transferir_tecla
-  ? [String(b.transferir_tecla), Number(b.transferir_espera ?? 60), b.transferir_audio || null]
-  : [null, 60, null]);
+const transferencia = (b) => {
+  if (!b.transferir_tecla) return [null, 60, null, null];
+  const audioGrabado = b.tipo === 'audio';
+  return [
+    String(b.transferir_tecla),
+    Number(b.transferir_espera ?? 60),
+    /* Con texto a voz, el audio del aviso se vuelve a generar al aprobar
+       (sin costo si el texto no cambió: los audios se reconocen por él). */
+    audioGrabado ? (b.transferir_audio || null) : null,
+    audioGrabado ? null : (String(b.transferir_texto || '').trim() || null),
+  ];
+};
 
 router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, res, next) => {
   try {
@@ -245,8 +262,8 @@ router.post('/blasters', auth.exigirSesion, auth.exigir('blaster'), async (req, 
           respuesta, respuesta_tipo, respuesta_guion, respuesta_opciones,
           respuesta_etiquetas, respuesta_digitos,
           hora_inicio, hora_fin, dias, reintentos, creado_por,
-          transferir_tecla, transferir_espera, transferir_audio)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          transferir_tecla, transferir_espera, transferir_audio, transferir_texto)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [String(b.nombre).trim(), b.campana_id, b.tipo || 'texto',
        b.guion || null, b.audio_archivo || null, b.voz_id || null,
        !!b.respuesta, b.respuesta_tipo || 'tecla',
@@ -287,7 +304,7 @@ router.put('/blasters/:id', auth.exigirSesion, auth.exigir('blaster'), async (re
               respuesta = ?, respuesta_tipo = ?, respuesta_guion = ?,
               respuesta_opciones = ?, respuesta_etiquetas = ?, respuesta_digitos = ?,
               hora_inicio = ?, hora_fin = ?, dias = ?, reintentos = ?,
-              transferir_tecla = ?, transferir_espera = ?, transferir_audio = ?,
+              transferir_tecla = ?, transferir_espera = ?, transferir_audio = ?, transferir_texto = ?,
               estado = 'borrador'
         WHERE id = ?`,
       [String(b.nombre).trim(), b.tipo, b.guion || null, b.audio_archivo || null, b.voz_id || null,
@@ -641,6 +658,14 @@ router.put('/blasters/:id/estado', auth.exigirSesion, auth.exigir('blaster'),
             return res.status(400).json({
               error: `Para transferir a un asesor, la campaña ${c?.nombre || ''} necesita una cola en la central` });
           }
+        }
+        /* El aviso escrito se convierte en audio ahora, con la misma voz
+           del mensaje. Si el texto no cambió desde la última vez, el
+           servicio de voz reutiliza el audio y no cobra de nuevo. */
+        if (b.transferir_tecla && b.tipo !== 'audio' && b.transferir_texto) {
+          const r = await voz.generar(String(b.transferir_texto).trim(), b.voz_id, `blaster-${id}-aviso`);
+          if (r.error) return res.status(400).json({ error: 'No se pudo generar el aviso de ocupados: ' + r.error });
+          await bd.consultar('UPDATE blaster SET transferir_audio = ? WHERE id = ?', [r.archivo, id]);
         }
         if (b.tipo === 'texto' && !b.audio_archivo) {
           return res.status(400).json({ error: 'Genera primero el audio del mensaje' });
