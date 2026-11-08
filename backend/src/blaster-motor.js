@@ -99,6 +99,11 @@ async function enCursoDe(blasterId) {
    Libre = en la cola, sin pausa y sin estar en una llamada (estado 1
    de la central: "no en uso").                                        */
 const POR_AGENTE = Number(process.env.BLASTER_POR_AGENTE) || 2;
+
+/* El número que ve el cliente en su pantalla. Va en el .env como
+   BLASTER_CLI. Sin él, las llamadas salen sin número, y los celulares con
+   "bloquear desconocidos" las mandan directo al buzón. */
+const NUMERO_PRESENTADO = String(process.env.BLASTER_CLI || CONFIG.blaster?.cli || '').replace(/\D/g, '');
 const transfiere = (b) => !!(b.transferir_tecla && b.cola);
 
 async function agentesLibres(cola) {
@@ -227,6 +232,7 @@ async function llamar(b, d) {
       identificador: `blaster-${d.id}`,
       contextoSalida: CONFIG.blaster?.contextoSalida || 'from-internal',
       ruta: await rutaDe(b.campana_id),
+      cli: NUMERO_PRESENTADO,
       extra: transfiere(b) ? {
         BPM_TRANSFER: b.transferir_tecla,
         BPM_COLA: b.cola,

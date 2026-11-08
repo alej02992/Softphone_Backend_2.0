@@ -282,7 +282,7 @@ class Ami extends EventEmitter {
    * suya, que ya está probada.
    */
   originarBlaster({ numero, audio, digitos = 0, identificador, espera = 40,
-                    contextoSalida = 'from-internal', identificadorLlamada, ruta, extra = {} }) {
+                    contextoSalida = 'from-internal', identificadorLlamada, ruta, extra = {}, cli = '' }) {
     /* Variables extra del blaster (la transferencia a un asesor). Solo
        pasan las que empiezan por BPM_ y tienen nombre conocido: nada que
        llegue de afuera puede inventar una variable de la central. */
@@ -297,6 +297,10 @@ class Ami extends EventEmitter {
       BPM_DIGITOS: digitos,
       BPM_ID: identificador || '',
       __RUTA: ruta || '',
+      /* El número que ve el cliente. Con dos guiones bajos, para que pase
+         al lado del canal que marca. Sin él, la llamada salía sin número
+         y los celulares que bloquean desconocidos la mandaban al buzón. */
+      __BPM_CLI: String(cli || '').replace(/\D/g, '').slice(0, 15),
       ...extras,
     })
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
