@@ -25,6 +25,20 @@ const ARCHIVO = '/etc/asterisk/extensions_flujos.conf';
 const CARPETA_AUDIO = CONFIG.tts?.carpeta || '/var/lib/asterisk/sounds/blaster';
 const PREFIJO_PRUEBA = '*77';
 
+/**
+ * Un número de entrada, como se guarda: solo dígitos; si tiene diez o
+ * más, los últimos diez (el número nacional sin 57 ni +57). Devuelve
+ * null si no es un número válido.
+ */
+function normalizar(numero) {
+  const d = String(numero || '').replace(/[\s().-]/g, '').replace(/^\+/, '');
+  if (!/^\d{3,15}$/.test(d)) return null;
+  return d.length >= 10 ? d.slice(-10) : d;
+}
+
+/* Las formas en que puede llegar un número nacional de diez dígitos */
+const formas = (n) => (n.length === 10 ? [n, `57${n}`, `+57${n}`, `0057${n}`] : [n]);
+
 const DIAS = { L: 'mon', M: 'tue', X: 'wed', J: 'thu', V: 'fri', S: 'sat', D: 'sun' };
 
 /* ═══════════ VALIDAR CONTRA LA REALIDAD ═══════════
@@ -219,14 +233,50 @@ async function publicar() {
     `exten => _${PREFIJO_PRUEBA}X,1,Goto(bpm-flujo-\${EXTEN:${PREFIJO_PRUEBA.length}},s,1)`,
     `exten => _${PREFIJO_PRUEBA}X.,1,Goto(bpm-flujo-\${EXTEN:${PREFIJO_PRUEBA.length}},s,1)`,
     '',
-    '; Llamadas que entran por las troncales. Mientras no haya números',
-    '; de entrada asignados a un flujo, se cuelgan con aviso en el registro.',
-    '[from-pstn]',
-    'exten => _X.,1,NoOp(Llamada entrante a ${EXTEN} sin flujo asignado)',
-    ' same => n,Hangup()',
-    'exten => s,1,NoOp(Llamada entrante sin número, sin flujo asignado)',
-    ' same => n,Hangup()',
   ];
+
+  /* ── Las llamadas que entran por las troncales ──
+     Toda llamada entra a "buscar", que mira qué flujo atiende el número:
+     primero el que marcó el cliente, y si no aparece, el de la cabecera
+     To (algunas troncales entregan la llamada a su propio usuario y el
+     número real viene ahí). Si no hay flujo, el de los números sin
+     asignar, o se cuelga dejando el número en el registro. */
+  const numeros = await bd.consultar(
+    `SELECT fn.numero, fn.flujo_id FROM flujo_numero fn
+       JOIN flujo f ON f.id = fn.flujo_id AND f.estado = 'activo'`).catch(() => []);
+  const porDefecto = numeros.find((x) => x.numero === '*');
+  const destino = porDefecto
+    ? `Goto(bpm-flujo-${entero(porDefecto.flujo_id, 1, 999999, 0)},s,1)` : 'Hangup()';
+
+  partes.push(
+    '; Llamadas que entran por las troncales: todas pasan por "buscar"',
+    '[from-pstn]',
+    'exten => _X.,1,Set(BPM_DID=${EXTEN})',
+    ' same => n,Goto(bpm-entrada,buscar,1)',
+    'exten => _+X.,1,Set(BPM_DID=${EXTEN})',
+    ' same => n,Goto(bpm-entrada,buscar,1)',
+    'exten => _[a-zA-Z].,1,Set(BPM_DID=${EXTEN})',
+    ' same => n,Goto(bpm-entrada,buscar,1)',
+    'exten => s,1,Set(BPM_DID=)',
+    ' same => n,Goto(bpm-entrada,buscar,1)',
+    '',
+    '[bpm-entrada]',
+    'exten => buscar,1,GotoIf($[${DIALPLAN_EXISTS(bpm-did,${BPM_DID},1)}]?bpm-did,${BPM_DID},1)',
+    ' same => n,Set(BPM_TO=${PJSIP_HEADER(read,To)})',
+    ' same => n,Set(BPM_TO=${CUT(BPM_TO,@,1)})',
+    ' same => n,Set(BPM_DID_TO=${CUT(BPM_TO,:,2)})',
+    ' same => n,GotoIf($[${DIALPLAN_EXISTS(bpm-did,${BPM_DID_TO},1)}]?bpm-did,${BPM_DID_TO},1)',
+    ' same => n,NoOp(Llamada entrante a ${BPM_DID} (To: ${BPM_DID_TO}) sin flujo asignado)',
+    ` same => n,${destino}`,
+    '',
+    '; Cada número de entrada, en todas las formas en que puede llegar',
+    '[bpm-did]');
+  numeros.filter((x) => x.numero !== '*').forEach((x) => {
+    const n = normalizar(x.numero);
+    if (!n) return;
+    formas(n).forEach((forma) => partes.push(
+      `exten => ${forma},1,Goto(bpm-flujo-${entero(x.flujo_id, 1, 999999, 0)},s,1)`));
+  });
 
   const { campanas } = await revisar({ nodos: [], flechas: [] });
   for (const f of activos) {
@@ -258,4 +308,4 @@ async function publicar() {
   return { flujos: activos.length };
 }
 
-module.exports = { revisar, traducir, publicar, ARCHIVO, PREFIJO_PRUEBA };
+module.exports = { revisar, traducir, publicar, normalizar, ARCHIVO, PREFIJO_PRUEBA };

@@ -98,6 +98,121 @@ const nombreValido = (txt) => {
   return { nombre: n };
 };
 
+/* ═══════════ NÚMEROS DE ENTRADA (fase 3) ═══════════
+   Qué flujo atiende cada número que entra por las troncales. Van antes
+   que /flujos/:id: si no, "numeros" se tomaría por el número de un flujo.
+
+   Cada cambio se publica en la central; si la central no lo acepta, se
+   deshace en la base y todo queda como estaba.                        */
+
+const activos = () => bd.consultar("SELECT id, nombre FROM flujo WHERE estado = 'activo' ORDER BY nombre");
+
+async function publicarODeshacer(deshacer) {
+  try {
+    await central.publicar();
+    return null;
+  } catch (e) {
+    await deshacer();
+    return e.message;
+  }
+}
+
+router.get('/flujos/numeros', auth.exigirSesion, auth.exigir('usuarios'), async (req, res, next) => {
+  try {
+    const filas = await bd.consultar(
+      `SELECT fn.id, fn.numero, fn.flujo_id, fn.descripcion, f.nombre AS flujo, f.estado
+         FROM flujo_numero fn JOIN flujo f ON f.id = fn.flujo_id ORDER BY fn.numero`);
+    const def = filas.find((x) => x.numero === '*');
+    res.json({
+      numeros: filas.filter((x) => x.numero !== '*'),
+      porDefecto: def ? def.flujo_id : null,
+      flujos: await activos(),
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/flujos/numeros', auth.exigirSesion, auth.exigir('usuarios'), async (req, res, next) => {
+  try {
+    const numero = central.normalizar(req.body?.numero);
+    if (!numero) return res.status(400).json({ error: 'El número debe tener solo dígitos, de 3 a 15' });
+    const flujoId = Number(req.body?.flujo_id);
+    if (!(await activos()).some((f) => f.id === flujoId)) {
+      return res.status(400).json({ error: 'Elige un flujo activo: uno en borrador no puede atender llamadas' });
+    }
+    const ya = await bd.una('SELECT id FROM flujo_numero WHERE numero = ?', [numero]);
+    if (ya) return res.status(409).json({ error: `El número ${numero} ya está asignado a un flujo` });
+
+    const r = await bd.consultar(
+      'INSERT INTO flujo_numero (numero, flujo_id, descripcion, creado_por) VALUES (?, ?, ?, ?)',
+      [numero, flujoId, String(req.body?.descripcion || '').slice(0, 120) || null, req.usuario.id]);
+    const fallo = await publicarODeshacer(() => bd.consultar('DELETE FROM flujo_numero WHERE id = ?', [r.insertId]));
+    if (fallo) return res.status(502).json({ error: fallo });
+
+    await auth.auditar(req.usuario.id, 'crear', 'flujo_numero', r.insertId,
+      `El número ${numero} lo atiende el flujo ${flujoId}`, req.ip);
+    res.status(201).json({ ok: true, id: r.insertId, numero });
+  } catch (e) { next(e); }
+});
+
+router.put('/flujos/numeros/:id', auth.exigirSesion, auth.exigir('usuarios'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const antes = await bd.una('SELECT numero, flujo_id, descripcion FROM flujo_numero WHERE id = ? AND numero <> ?', [id, '*']);
+    if (!antes) return res.status(404).json({ error: 'Ese número no existe' });
+    const flujoId = Number(req.body?.flujo_id ?? antes.flujo_id);
+    if (!(await activos()).some((f) => f.id === flujoId)) {
+      return res.status(400).json({ error: 'Elige un flujo activo' });
+    }
+    const desc = req.body?.descripcion === undefined ? antes.descripcion : String(req.body.descripcion).slice(0, 120) || null;
+    await bd.consultar('UPDATE flujo_numero SET flujo_id = ?, descripcion = ? WHERE id = ?', [flujoId, desc, id]);
+    const fallo = await publicarODeshacer(() =>
+      bd.consultar('UPDATE flujo_numero SET flujo_id = ?, descripcion = ? WHERE id = ?', [antes.flujo_id, antes.descripcion, id]));
+    if (fallo) return res.status(502).json({ error: fallo });
+
+    await auth.auditar(req.usuario.id, 'modificar', 'flujo_numero', id,
+      `El número ${antes.numero} ahora lo atiende el flujo ${flujoId}`, req.ip);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.delete('/flujos/numeros/:id', auth.exigirSesion, auth.exigir('usuarios'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const antes = await bd.una('SELECT * FROM flujo_numero WHERE id = ? AND numero <> ?', [id, '*']);
+    if (!antes) return res.status(404).json({ error: 'Ese número no existe' });
+    await bd.consultar('DELETE FROM flujo_numero WHERE id = ?', [id]);
+    const fallo = await publicarODeshacer(() => bd.consultar(
+      'INSERT INTO flujo_numero (id, numero, flujo_id, descripcion, creado_por) VALUES (?, ?, ?, ?, ?)',
+      [antes.id, antes.numero, antes.flujo_id, antes.descripcion, antes.creado_por]));
+    if (fallo) return res.status(502).json({ error: fallo });
+
+    await auth.auditar(req.usuario.id, 'eliminar', 'flujo_numero', id, `Quitó el número ${antes.numero}`, req.ip);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+/* El flujo de los números sin asignar: { flujo_id } o { flujo_id: null } para colgar */
+router.put('/flujos/numeros-por-defecto', auth.exigirSesion, auth.exigir('usuarios'), async (req, res, next) => {
+  try {
+    const flujoId = req.body?.flujo_id ? Number(req.body.flujo_id) : null;
+    if (flujoId && !(await activos()).some((f) => f.id === flujoId)) {
+      return res.status(400).json({ error: 'Elige un flujo activo' });
+    }
+    const antes = await bd.una("SELECT flujo_id FROM flujo_numero WHERE numero = '*'");
+    const poner = (fid) => (fid
+      ? bd.consultar(`INSERT INTO flujo_numero (numero, flujo_id, creado_por) VALUES ('*', ?, ?)
+                        ON DUPLICATE KEY UPDATE flujo_id = VALUES(flujo_id)`, [fid, req.usuario.id])
+      : bd.consultar("DELETE FROM flujo_numero WHERE numero = '*'"));
+    await poner(flujoId);
+    const fallo = await publicarODeshacer(() => poner(antes?.flujo_id || null));
+    if (fallo) return res.status(502).json({ error: fallo });
+
+    await auth.auditar(req.usuario.id, 'modificar', 'flujo_numero', 0,
+      flujoId ? `Los números sin asignar los atiende el flujo ${flujoId}` : 'Los números sin asignar se cuelgan', req.ip);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 /* ═══════════ LISTA ═══════════ */
 
 router.get('/flujos', auth.exigirSesion, auth.exigir('usuarios'),
@@ -287,6 +402,13 @@ router.post('/flujos/:id/desactivar', auth.exigirSesion, auth.exigir('usuarios')
       const id = Number(req.params.id);
       const f = await bd.una('SELECT nombre, estado FROM flujo WHERE id = ?', [id]);
       if (!f) return res.status(404).json({ error: 'Ese flujo no existe' });
+
+      const usan = await bd.consultar('SELECT numero FROM flujo_numero WHERE flujo_id = ?', [id]);
+      if (usan.length) {
+        const lista = usan.map((x) => (x.numero === '*' ? 'los números sin asignar' : x.numero)).join(', ');
+        return res.status(409).json({
+          error: `Este flujo atiende ${lista}. Asígnales otro flujo antes de desactivarlo.` });
+      }
 
       await bd.consultar("UPDATE flujo SET estado = 'borrador' WHERE id = ?", [id]);
       try {
